@@ -396,7 +396,14 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     // MMQ_ITER_K / (4 * QR8_0) == 64 required. but NV has only 32 threads per warp
+#if defined(GGML_USE_HIP) && defined(GCN5)
+    // gfx906 (wave64): fewer threads-per-row load more rows per warp with
+    // better HBM coalescing. Swept 32/16/8/4 - 8 is fastest (~+50% pp512 vs
+    // 32) and the correctness floor - below 8 under-covers QI8_0 and diverges.
+    constexpr int threads_per_row = 8;
+#else
     constexpr int threads_per_row = 32;
+#endif
     constexpr int nrows = warp_size / threads_per_row;
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
     const int kbx  = txi / QI8_0;
@@ -416,8 +423,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_qs[i*sram_stride + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
         x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+#pragma unroll
+        for (int k = 0; k < 2*MMQ_TILE_NE_K; k += threads_per_row) {
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k + txi] = get_int_b2(bxi[k/QI8_0].qs, kqsx);
+        }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
