@@ -63,6 +63,26 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+static ggml_tensor * ggml_mul_mat_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res;
+
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d   (ctx, cur, n, ggml_nelements(cur)/n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    }
+    res = ggml_mul_mat   (ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -468,8 +488,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    // the mask is left unallocated when the graph only stores K/V without attending
-    // (e.g. DFlash's KV-injection pass)
+    // The mask is left unallocated when a graph only stores K/V without attending:
+    // the MTP KV-only prefill (Phase 2b), or upstream's DFlash KV-injection pass.
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
@@ -493,7 +513,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    // kq_mask may be unallocated for the MTP KV-only prefill graph (no attention built); skip its
+    // reuse check there. Normal attention graphs always allocate it, so this only affects KV-only.
+    if (self_kq_mask && self_kq_mask->buffer) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -2699,6 +2723,33 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     return cur;
+}
+
+void llm_graph_context::build_attn_store_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   il) const {
+    // Mirrors the K/V-store block of build_attn (above) exactly: apply the optional fused
+    // K/V rotation, expand, then write into the KV cache via cpy_k/cpy_v. No attention,
+    // wo, or output is built - the MTP head's prefill replay only needs the prompt K/V stored.
+    if (inp->self_k_rot) {
+        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    const auto & k_idxs = inp->get_k_idxs();
+    const auto & v_idxs = inp->get_v_idxs();
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
 }
 
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(

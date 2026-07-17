@@ -599,7 +599,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // n_outputs-conditional: the deferred-prefill / KV-only replay decodes with n_outputs == 0
+    // (batch logits all 0). build_inp_out_ids() would then make a 0-size out_ids whose buffer is
+    // never allocated, tripping the buffer assert in llm_graph_input_out_ids::set_input. Skip it
+    // when there is nothing to select (n_outputs == 0, or == n_tokens where the rows are identity).
+    ggml_tensor * inp_out_ids = n_outputs > 0 && n_outputs < n_tokens ? build_inp_out_ids() : nullptr;
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -727,7 +731,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "h_nextn", -1);
     res->t_h_nextn= cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

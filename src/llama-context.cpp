@@ -420,12 +420,25 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // -sm tensor with -tps T < n_devs creates an internally multi-stage Meta device that
+        // benefits from sched n_copies>1 (multiple ubatches in flight across stages); the
+        // model exposes only one llama_device (the Meta) so model.n_devices() == 1, hence
+        // the n_devices > 1 gate is replaced by a per-mode guard.
         bool pipeline_parallel =
-            model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !model.has_tensor_overrides() &&
+            ((model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) ||
+             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR);
+
+        // The MTP draft context replays only a few small (single-layer) decodes at begin(); a deep
+        // pipeline ring adds idle compute-buffer copies with no throughput benefit for that tiny
+        // graph. Disabling it for the draft measurably improves generation throughput (+~6% TG,
+        // bit-exact) and frees the draft's ring memory, with no effect on prompt-eval. Opt back in
+        // with LLAMA_MTP_DRAFT_PIPELINE for debugging.
+        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !getenv("LLAMA_MTP_DRAFT_PIPELINE")) {
+            pipeline_parallel = false;
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -1171,6 +1184,52 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
+    if (n_tokens_cap <= 0) {
+        buf_pre_norm_accum.reset();
+        embd_pre_norm_accum      = nullptr;
+        embd_pre_norm_accum_size = 0;
+        return nullptr;
+    }
+
+    const uint32_t n_embd   = model.hparams.n_embd_out(); // match the t_h_nextn extract stride
+    const size_t   nfloats  = (size_t) n_tokens_cap * n_embd;
+    const size_t   nbytes   = nfloats * sizeof(float);
+
+    // Pinned host buffer so the per-chunk pre-norm D2H stays truly asynchronous (a D2H
+    // into pageable memory blocks the stream). Same buffer type as the output buffer.
+    auto * buft = ggml_backend_cpu_buffer_type();
+    auto * output_dev = model.dev_output();
+    auto * host_buft  = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+    if (host_buft) {
+        buft = host_buft;
+    }
+
+    buf_pre_norm_accum.reset(ggml_backend_buft_alloc_buffer(buft, nbytes));
+    if (buf_pre_norm_accum == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate pre-norm accum buffer of size %.2f MiB\n",
+                __func__, nbytes / (1024.0 * 1024.0));
+        embd_pre_norm_accum      = nullptr;
+        embd_pre_norm_accum_size = 0;
+        return nullptr;
+    }
+
+    // Clear so any prompt position that is not extracted (e.g. served from the prompt
+    // cache without a fresh decode) reads as zero rather than garbage / NaN, which would
+    // otherwise poison the draft and trip the non-finite fallback.
+    ggml_backend_buffer_clear(buf_pre_norm_accum.get(), 0);
+
+    embd_pre_norm_accum      = (float *) ggml_backend_buffer_get_base(buf_pre_norm_accum.get());
+    embd_pre_norm_accum_size = nfloats;
+    embd_pre_norm_accum_ub   = 0;
+    return embd_pre_norm_accum;
+}
+
+float * llama_context::get_embeddings_pre_norm_accum() {
+    synchronize();
+    return embd_pre_norm_accum;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1987,11 +2046,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                const uint32_t n_embd = hparams.n_embd_out();
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                // MTP deferred prefill: when an accum buffer is set (unmasked target during
+                // prompt prefill), extract straight into the position-indexed accum buffer
+                // and skip the per-batch embd_nextn copy, which is unused during prefill.
+                // This keeps the whole prompt hidden across decode calls without a per-chunk
+                // synchronize and avoids a second D2H. Assumes a contiguous ubatch (single
+                // sequence, sequential positions), which holds for prefill.
+                const bool accum_active = embd_pre_norm_accum && !masked && ubatch.pos;
+                if (accum_active) {
+                    const int64_t p0 = ubatch.pos[0];
+                    if (p0 >= 0 && (size_t) (p0 + n_rows)*n_embd <= embd_pre_norm_accum_size) {
+                        float * dst = embd_pre_norm_accum + (size_t) p0*n_embd;
+                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst, 0, n_rows*n_embd*sizeof(float));
+
+                        // The async extract reads t_h_nextn straight from the scheduler's
+                        // rotating compute buffer (one slot per copy in the pipeline ring). With
+                        // pipeline parallelism the ring wraps every n_copies ubatches and reuses a
+                        // slot's buffer/stream; without a synchronize the next-wrap compute clobbers
+                        // a slot whose async D2H has not drained, corrupting the staged hidden. The
+                        // normal path is safe because callers synchronize before reading the output;
+                        // the deferred-prefill path does not. Bound the in-flight extracts to the
+                        // ring size: drain once every n_copies ubatches (vs the per-chunk synchronize
+                        // that serialized the prefill and caused the MTP PP regression). This keeps
+                        // the prefill pipelining within each ring-sized window.
+                        const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
+                        if (n_copies > 1 && (++embd_pre_norm_accum_ub % n_copies) == 0) {
+                            ggml_backend_sched_synchronize(sched.get());
+                        }
+                    }
+                } else {
+                    float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 
@@ -3718,6 +3807,18 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_mtp_prefill_kv_only(llama_context * ctx, bool value) {
+    ctx->set_mtp_prefill_kv_only(value);
+}
+
+float * llama_set_embeddings_pre_norm_accum(llama_context * ctx, int32_t n_tokens_cap) {
+    return ctx->set_embeddings_pre_norm_accum(n_tokens_cap);
+}
+
+float * llama_get_embeddings_pre_norm_accum(llama_context * ctx) {
+    return ctx->get_embeddings_pre_norm_accum();
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

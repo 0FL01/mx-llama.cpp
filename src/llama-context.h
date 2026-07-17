@@ -116,6 +116,11 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_prefill_kv_only(bool value) { cparams.mtp_prefill_kv_only = value; }
+    // Enable (n_tokens_cap > 0) or disable (0) a pinned position-indexed pre-norm accum
+    // buffer for MTP deferred prefill. Returns the buffer base (or nullptr).
+    float * set_embeddings_pre_norm_accum(int32_t n_tokens_cap);
+    float * get_embeddings_pre_norm_accum(); // synchronizes, then returns the accum base
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -304,6 +309,16 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
 
+    // Optional position-indexed host accumulation buffer for MTP deferred prefill.
+    // When set (caller-owned host memory), the unmasked pre-norm extraction also
+    // async-copies each ubatch's hidden rows here at their sequence-position offset,
+    // so the whole prompt hidden survives across decode calls without a per-chunk
+    // synchronize. This lets the MTP hook skip its per-prefill-chunk target sync and
+    // build the draft KV in one pass after prefill. nullptr by default (no change).
+    float * embd_pre_norm_accum      = nullptr; // base of buf_pre_norm_accum (pinned), or null
+    size_t  embd_pre_norm_accum_size = 0;        // capacity in floats
+    int64_t embd_pre_norm_accum_ub   = 0;        // ubatch counter for the ring-wrap drain
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -369,6 +384,9 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // pinned host buffer backing embd_pre_norm_accum (MTP deferred prefill)
+    ggml_backend_buffer_ptr buf_pre_norm_accum;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
