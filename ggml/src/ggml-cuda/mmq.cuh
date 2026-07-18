@@ -219,6 +219,7 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
 #include "mmq-config-rdna4.cuh"
+#include "mmq-config-gfx906.cuh" // gfx906 wraps rdna2, must be included after it
 
 #undef CASE
 
@@ -229,6 +230,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         }
         if (amd_wmma_available(cc)) {
             return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
+        }
+        if (cc == GGML_CUDA_CC_VEGA20) {
+            return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
         }
         return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
     }
@@ -247,6 +251,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
 #elif defined(AMD_WMMA_AVAILABLE)
     return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
+#elif defined(__gfx906__)
+    return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 #endif // CDNA
@@ -1374,6 +1380,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int    nsm   = ggml_cuda_info().devices[id].nsm;
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
@@ -1389,6 +1396,18 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
 
         const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+
+        // gfx906: do not widen J past 64 if the tile grid can no longer fill the
+        // CUs - this is what regresses -sm tensor (rows sharded) and MoE (tiny
+        // per-expert shapes). Keep total tiles >= nsm.
+        if (cc == GGML_CUDA_CC_VEGA20 && config.J > 64) {
+            // MoE (ids): tiny per-expert shape never benefits from wide tiles, and
+            // the total-tiles heuristic overcounts it - always cap MoE at J=64.
+            if (args.ids_dst != nullptr) { continue; }
+            const int nty = (args.nrows_x + config.I - 1) / config.I;
+            const long total_tiles = (long) nty * ntiles_x * args.nchannels_y * args.nsamples_y;
+            if (total_tiles < nsm) { continue; }
+        }
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
