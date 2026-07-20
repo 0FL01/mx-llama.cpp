@@ -378,6 +378,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 if (type == GGML_TYPE_Q8_0) {
                     return 2;
                 }
+                [[fallthrough]];
             case 6:
             case 7:
             case 8:
