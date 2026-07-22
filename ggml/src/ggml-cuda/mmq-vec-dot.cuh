@@ -120,6 +120,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const float * y_df = (const float *) y;
 
 // #pragma unroll
+#if defined(__gfx906__)
+    // gfx906 (Vega20): LDS capacity pins this kernel to one block per CU, so residency
+    // is 2 waves per SIMD and roughly 128 VGPR per wave go unused. Spending some of that
+    // on a partial unroll of k buys fewer address computations per dot product, because
+    // the y stride between j iterations (1152 bytes) overshoots the ds_read2_b32 immediate
+    // offset range (1020 bytes) and each j otherwise needs a materialised address.
+    // Measured on the Q8_0 instance: 22% fewer v_add and 20% fewer LDS reads per v_dot4,
+    // with no spilling on either ROCm 6.3 (clang 18) or 7.2 (clang 22).
+    // Only Q8_0 can afford this. Every other quant sits at 166 VGPR against Q8_0's 96 and
+    // spills when unrolled, which is why the pragma above stays commented out in general.
+    // Do not raise the factor either: a full unroll spills about 686 registers and costs
+    // roughly half the prefill throughput.
+    #pragma unroll 2
+#endif // defined(__gfx906__)
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;
 
