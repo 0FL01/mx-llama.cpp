@@ -44,15 +44,14 @@ gated-delta-net warp counts.
 ## Building from source
 
 Requires a ROCm toolchain with gfx906 support (rocBLAS gfx906 kernels, plus RCCL
-and rocWMMA for the respective flags). Note gfx906 is deprecated in ROCm 7.x. See
-`docs/build.md` for general HIP build background.
+for `GGML_HIP_RCCL`). Note gfx906 is deprecated in ROCm 7.x. See `docs/build.md`
+for general HIP build background.
 
 ```bash
 cmake -B build \
   -DGGML_HIP=ON \
   -DGGML_HIP_GRAPHS=ON \
   -DGGML_HIP_RCCL=ON \
-  -DGGML_HIP_ROCWMMA_FATTN=ON \
   -DLLAMA_OPENSSL=ON \
   -DAMDGPU_TARGETS=gfx906 \
   -DCMAKE_BUILD_TYPE=Release \
@@ -76,20 +75,23 @@ On a trimmed ROCm runtime (such as the slim Docker image) also set
 `HSA_OVERRIDE_GFX_VERSION=9.0.6` so the runtime recognizes the gfx906 GPU. A full
 ROCm install detects it automatically and does not need this.
 
-Always pass `--no-mmap -dio` (or `-mmp 0 -dio 1` for `llama-bench`). mmap on the
-model file hangs on this stack. Select GPUs with `HIP_VISIBLE_DEVICES` (AMD) or
-`CUDA_VISIBLE_DEVICES` (NVIDIA); the example commands below use the AMD form.
+Always pass `-lm dio` (`--load-mode dio`). mmap on the model file hangs on this
+stack. The older `--no-mmap` / `-dio` spellings still parse but are deprecated
+upstream, and in `llama-bench` they append two separate load modes, so the old
+two-flag form runs every benchmark twice. Select GPUs with `HIP_VISIBLE_DEVICES`
+(AMD) or `CUDA_VISIBLE_DEVICES` (NVIDIA); the example commands below use the AMD
+form.
 
 ```bash
 # multi-GPU tensor-parallel server (4 GPUs, full TP)
 HIP_VISIBLE_DEVICES=0,1,2,3 llama-server -m model.gguf \
-  -ngl 99 -fa 1 -sm tensor -tps 0 --no-mmap -dio --host 0.0.0.0 --port 8080
+  -ngl 99 -fa 1 -sm tensor -tps 0 -lm dio --host 0.0.0.0 --port 8080
 
 # 8 GPUs as 4 TP groups of 2 (TP=2, PP=4)
 HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 llama-cli -m model.gguf \
-  -ngl 99 -fa 1 -sm tensor -tps 2 --no-mmap -dio
+  -ngl 99 -fa 1 -sm tensor -tps 2 -lm dio
 
 # MTP speculative decode (Qwen3.6 dense)
 HIP_VISIBLE_DEVICES=0,1 llama-cli -m Qwen3.6-27B-MTP.gguf \
-  -ngl 99 -fa 1 -sm tensor --spec-type draft-mtp --no-mmap -dio
+  -ngl 99 -fa 1 -sm tensor --spec-type draft-mtp -lm dio
 ```
