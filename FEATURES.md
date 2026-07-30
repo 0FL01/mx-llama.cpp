@@ -41,6 +41,14 @@ Hardware-specific tuning for gfx906 / VEGA20 (MI50, MI60, Radeon VII, Radeon Pro
 VII): MMQ tile-width selection, q8_1 quantization, top-k MoE row handling, and
 gated-delta-net warp counts.
 
+## BF16 compute on AMD without native bfloat16
+
+On AMD parts predating CDNA and RDNA3, BF16 matmuls compute in F32. rocBLAS has
+no tuned bf16 kernel for that hardware, and `compute_type=BF16` also rounds the
+F32 activations down to bf16, so F32 is both faster and more faithful. Automatic,
+no flag. Worth +18-19% prefill on UD / `*_XL` quants that keep BF16 tensors.
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute type.
+
 ## Building from source
 
 Requires a ROCm toolchain with gfx906 support (rocBLAS gfx906 kernels, plus RCCL
