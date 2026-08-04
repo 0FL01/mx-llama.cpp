@@ -30,6 +30,18 @@ KV staging, a KV-only prefill replay, disabling the draft context's pipeline rin
 and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
 with these disabled. Backend-generic.
 
+## Concurrent lane dispatch
+
+Under `-sm tensor` the meta backend issued each subgraph to its GPUs in device
+order, so the AllReduce closing it waited on the last one, and with ~81 such
+subgraphs per token that stagger was rebuilt at every one. The lanes are now
+issued concurrently, which is bit-exact. The gain tracks how many GPUs share one
+tensor-parallel group: measured on Qwen3.6-35B-A3B, +32% token generation on an
+8-GPU tensor split and +2.5% on 4, with prefill flat. Under multi-stage `-tps`
+it follows the group size rather than the total GPU count. On by default;
+`GGML_META_PARALLEL_DISPATCH=0` restores the serial issue. Inert unless at least
+two GPUs share a tensor split. CUDA / ROCm sub-backends only.
+
 ## Multi-GPU transfer tuning
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point

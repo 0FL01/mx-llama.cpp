@@ -6,16 +6,20 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -1653,6 +1657,145 @@ static ggml_guid_t ggml_backend_meta_guid() {
     return &guid;
 }
 
+// Persistent worker pool that issues one lane's graph_compute_async per thread, so all
+// lanes of a subgraph start together instead of in device order. See the comment on
+// ggml_backend_meta_context::parallel_dispatch for the measurement that motivates it.
+//
+// Wait strategy: a SHORT bounded spin to catch the fast case without a syscall, then BLOCK
+// on a condition variable. An earlier version spun indefinitely, which pegged one core per
+// worker - 7 of 16 cores at 8 lanes - because the idle gap between fork-joins is roughly
+// token_time/n_subgraphs, on the order of 160 us. That is far too long to busy-wait, and
+// it is antisocial on a shared machine. The ~5-10 us wake cost is small against the
+// per-lane issue cost the pool exists to overlap (about 200 us of stagger at 8 lanes).
+// The spin count is not worth tuning: 0 and 512 measure the same, and 65536 doubles
+// host CPU for 1.3% less throughput.
+//
+// Thread safety: ggml_cuda_set_device resolves the current device through cudaGetDevice,
+// which is thread-local in the CUDA/HIP runtime, and every per-lane backend owns its own
+// context, streams, graph cache and memory pool. Lanes therefore share no mutable state.
+struct ggml_backend_meta_lane_dispatcher {
+    struct job {
+        ggml_backend_t backend = nullptr;
+        ggml_cgraph *  cgraph  = nullptr;
+        ggml_status    status  = GGML_STATUS_SUCCESS;
+    };
+
+    std::vector<std::thread> workers;
+    std::vector<job>         jobs;
+    std::atomic<uint64_t>    generation{0};
+    std::atomic<uint32_t>    remaining{0};
+    std::atomic<bool>        stop{false};
+
+    std::mutex              mtx;
+    std::condition_variable cv_work;   // main -> workers
+    std::condition_variable cv_done;   // workers -> main
+
+    static const int spin_iters = 512;
+
+    ~ggml_backend_meta_lane_dispatcher() { shutdown(); }
+
+    void shutdown() {
+        if (workers.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop.store(true, std::memory_order_release);
+            generation.fetch_add(1, std::memory_order_release);
+        }
+        cv_work.notify_all();
+        for (std::thread & t : workers) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        workers.clear();
+        jobs.clear();
+    }
+
+    // n_workers is lane_count-1: the calling thread always runs one lane itself.
+    void ensure(size_t n_workers) {
+        if (workers.size() == n_workers) {
+            return;
+        }
+        shutdown();
+        if (n_workers == 0) {
+            return;
+        }
+        jobs.assign(n_workers, job{});
+        stop.store(false, std::memory_order_relaxed);
+        generation.store(0, std::memory_order_relaxed);
+        remaining.store(0, std::memory_order_relaxed);
+        workers.reserve(n_workers);
+        for (size_t w = 0; w < n_workers; w++) {
+            workers.emplace_back([this, w]() {
+                uint64_t seen = 0;
+                while (true) {
+                    // Short spin first: if the main thread is already publishing, this
+                    // catches it without paying a futex round trip.
+                    uint64_t gen = generation.load(std::memory_order_acquire);
+                    for (int s = 0; gen == seen && s < spin_iters; s++) {
+                        gen = generation.load(std::memory_order_acquire);
+                    }
+                    if (gen == seen) {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        cv_work.wait(lk, [&] {
+                            return generation.load(std::memory_order_acquire) != seen;
+                        });
+                        gen = generation.load(std::memory_order_acquire);
+                    }
+                    seen = gen;
+                    if (stop.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    job & jb = jobs[w];
+                    if (jb.cgraph != nullptr) {
+                        jb.status = ggml_backend_graph_compute_async(jb.backend, jb.cgraph);
+                    }
+                    if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        std::lock_guard<std::mutex> lk(mtx);
+                        cv_done.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    // Publish one job per worker and release them. Every worker decrements `remaining`
+    // exactly once per round, including workers left with a null cgraph, so the join below
+    // is balanced regardless of how many lanes were actually filled.
+    void dispatch_async() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            remaining.store((uint32_t) workers.size(), std::memory_order_release);
+            generation.fetch_add(1, std::memory_order_release);
+        }
+        cv_work.notify_all();
+    }
+
+    ggml_status join() {
+        uint32_t left = remaining.load(std::memory_order_acquire);
+        for (int s = 0; left != 0 && s < spin_iters; s++) {
+            left = remaining.load(std::memory_order_acquire);
+        }
+        if (left != 0) {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_done.wait(lk, [&] {
+                return remaining.load(std::memory_order_acquire) == 0;
+            });
+        }
+        ggml_status ret = GGML_STATUS_SUCCESS;
+        for (job & jb : jobs) {
+            if (jb.cgraph != nullptr && jb.status != GGML_STATUS_SUCCESS) {
+                ret = jb.status;
+            }
+            jb.cgraph = nullptr;
+            jb.status = GGML_STATUS_SUCCESS;
+        }
+        return ret;
+    }
+};
+
 struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
@@ -1735,6 +1878,19 @@ struct ggml_backend_meta_context {
     bool dbg_part = false; // GGML_META_PART_DEBUG (only fires on partition rebuild)
     bool dbg_run  = false; // GGML_META_RUN_DEBUG  (per graph_compute)
     bool dbg_xfer = false; // GGML_META_XFER_DEBUG (per stage_transfer)
+
+    // Concurrent per-lane graph dispatch. On by default, GGML_META_PARALLEL_DISPATCH=0
+    // restores the serial per-lane issue.
+    //
+    // The subgraph loop in graph_compute issues ggml_backend_graph_compute_async to each
+    // lane in turn, so lane 0 is enqueued first and lane N-1 last. Nearly every subgraph
+    // ends in an AllReduce that then waits for the last lane to arrive, so the per-lane
+    // host issue cost converts directly into rank skew. Measured on 4 GPUs: the 4th lane
+    // arrives 86.8 us late, ranks leave the collective within 0.64 us of each other, and
+    // 74.9% of the AR kernel time is that wait. With 80 AllReduce subgraphs per token the
+    // staircase is rebuilt 80 times. Issuing the lanes concurrently removes it.
+    bool parallel_dispatch = false;
+    ggml_backend_meta_lane_dispatcher dispatcher;
 
     // Sync-fallback scratch for set_tensor_async on layouts the chunk-by-chunk path can't handle:
     // multi-segment splits, and PARTIAL axis (per-device 1/N scaling needs the whole tensor).
@@ -1856,9 +2012,43 @@ struct ggml_backend_meta_context {
             const char * v = getenv(name);
             return v && atoi(v) != 0;
         };
+        // For flags that default on, so that only an explicit 0 turns them off.
+        auto env_flag_on = [](const char * name) {
+            const char * v = getenv(name);
+            return v == nullptr || atoi(v) != 0;
+        };
         dbg_part = env_flag("GGML_META_PART_DEBUG");
         dbg_run  = env_flag("GGML_META_RUN_DEBUG");
         dbg_xfer = env_flag("GGML_META_XFER_DEBUG");
+
+        // On by default, and only does anything with more than one lane per stage.
+        //
+        // Restricted to CUDA/ROCm sub-backends on purpose. The dispatcher itself is
+        // portable C++11, but the SAFETY argument is not: it relies on the current device
+        // being thread-local (cudaGetDevice) and on each lane owning its own context,
+        // streams, graph cache and pool. This meta backend wraps arbitrary
+        // ggml_backend_dev_t, and concurrent graph_compute has not been verified for
+        // Vulkan / SYCL / Metal / CPU sub-backends. Refuse rather than assume.
+        parallel_dispatch = env_flag_on("GGML_META_PARALLEL_DISPATCH") && tps > 1;
+        if (parallel_dispatch) {
+            for (size_t i = 0; i < n_devs; i++) {
+                ggml_backend_dev_t d = ggml_backend_meta_dev_simple_dev(meta_dev, i);
+                ggml_backend_reg_t r = d != nullptr ? ggml_backend_dev_backend_reg(d) : nullptr;
+                const char * rn = r != nullptr ? ggml_backend_reg_name(r) : nullptr;
+                const bool ok = rn != nullptr &&
+                                (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
+                if (!ok) {
+                    GGML_LOG_DEBUG("%s: serial lane dispatch, concurrent issue is "
+                                   "unverified for backend '%s'\n",
+                                   __func__, rn != nullptr ? rn : "(unknown)");
+                    parallel_dispatch = false;
+                    break;
+                }
+            }
+        }
+        if (parallel_dispatch) {
+            dispatcher.ensure(tps - 1);
+        }
     }
 
     ~ggml_backend_meta_context() {
@@ -2823,11 +3013,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             fprintf(stderr, "[run] sg%zu stage=%zu lanes=[%zu,%zu) n_nodes=%d first=%s last=%s closure=%d\n",
                     i, stage, lane_lo, lane_hi, cg0->n_nodes, first, last, (int) sg.closure);
         }
-        for (size_t j = lane_lo; j < lane_hi; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+        // Issuing the lanes in order makes lane_hi-1 arrive at the closure below last, and
+        // the AllReduce bills that wait as its own runtime. Hand the trailing lanes to the
+        // worker pool so every lane starts together, and keep lane_lo on this thread.
+        if (backend_ctx->parallel_dispatch && lane_hi - lane_lo > 1) {
+            auto & disp = backend_ctx->dispatcher;
+            GGML_ASSERT(disp.jobs.size() >= lane_hi - lane_lo - 1);
+            for (size_t j = lane_lo + 1; j < lane_hi; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                auto & jb  = disp.jobs[j - lane_lo - 1];
+                jb.backend = bcj.backend;
+                jb.cgraph  = bcj.cgraphs[i].cgraph_main;
+            }
+            disp.dispatch_async();
+
+            auto & bc0 = backend_ctx->backend_configs[lane_lo];
+            const ggml_status status_self = ggml_backend_graph_compute_async(bc0.backend, bc0.cgraphs[i].cgraph_main);
+
+            // Join before inspecting either status: the workers must be quiesced before we
+            // can return, otherwise they would still be touching backend state.
+            const ggml_status status_workers = disp.join();
+            if (status_self != GGML_STATUS_SUCCESS) {
+                return status_self;
+            }
+            if (status_workers != GGML_STATUS_SUCCESS) {
+                return status_workers;
+            }
+        } else {
+            for (size_t j = lane_lo; j < lane_hi; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
 
