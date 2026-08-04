@@ -701,6 +701,17 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    if (q8_1_cache_hits + q8_1_cache_misses > 0) {
+        GGML_LOG_DEBUG(GGML_CUDA_NAME " q8_1 cache[%d]: %zu hits, %zu misses, "
+                       "%zu entries at peak\n", device, q8_1_cache_hits,
+                       q8_1_cache_misses, q8_1_cache_peak);
+    }
+
+    // Release the held pool allocations while the pools are still alive. Members
+    // are destroyed in reverse declaration order, so leaving this to the implicit
+    // destructor tears the pool down first and trips its pool_size == 0 assert.
+    q8_1_cache_reset();
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2244,6 +2255,93 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     return use_mul_mat_vec_q;
+}
+
+// One entry would do. Measured on Qwen3.6-35B-A3B and Qwen3-14B, the hit count is
+// identical at a bound of 1, 2, 4, 8, 16 and 32: an activation is consumed by the
+// matmuls immediately following it - q/k/v read one attn_norm back to back - so the
+// reuse distance is one and further slots never serve a request. Decode throughput is
+// flat across those bounds too, checked in both ascending and descending order because
+// a single-direction sweep showed an ordering that turned out to be position in the run
+// rather than the bound.
+//
+// So the bound is chosen on memory, the only thing that varies with it. It caps the
+// entry COUNT while entry size scales with ubatch: eight entries reach 153 MiB per
+// device at -ub 8192 against 9.7 MiB at -ub 512. Two keeps that at about 39 MiB while
+// leaving a spare slot for a graph that interleaves two activations.
+#define GGML_CUDA_Q8_1_CACHE_MAX_ENTRIES 2
+
+// On by default. GGML_CUDA_Q8_1_CACHE=0 disables it, which restores the previous
+// behaviour exactly: every matmul quantizes its own copy of src1.
+static bool ggml_cuda_q8_1_cache_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_Q8_1_CACHE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// Hand back the quantized copy of src1 made earlier in this graph evaluation, or
+// allocate a fresh buffer and report a miss so the caller quantizes into it. The
+// variant separates layouts that are not interchangeable (mmvq row-wise vs each
+// mmq ds layout), since only identical layouts may be shared.
+//
+// Reuse is sound because ggml-alloc keeps a tensor's buffer live until its last
+// consumer has run, so while a pending matmul still names src1 nothing else can
+// have written over it. Evicted buffers are likewise safe: the kernel consuming
+// one is enqueued before the buffer returns to the pool, and the pool hands it
+// out again only on the same stream, so any reuse is sequenced after that read.
+char * ggml_cuda_q8_1_cache_acquire(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int variant,
+        const int64_t ne_padded, const int64_t s11, const int64_t s12, const int64_t s13,
+        const size_t nbytes, bool & hit) {
+    hit = false;
+
+    if (!ggml_cuda_q8_1_cache_enabled() || !src1) {
+        return nullptr;
+    }
+
+    for (const ggml_backend_cuda_context::q8_1_cache_entry & e : ctx.q8_1_cache) {
+        if (e.src1 == src1 && e.data == src1->data && e.variant == variant &&
+            e.ne_padded == ne_padded && e.nbytes == nbytes &&
+            e.stride[0] == s11 && e.stride[1] == s12 && e.stride[2] == s13 &&
+            e.ne[0] == src1->ne[0] && e.ne[1] == src1->ne[1] &&
+            e.ne[2] == src1->ne[2] && e.ne[3] == src1->ne[3]) {
+            hit = true;
+            ctx.q8_1_cache_hits++;
+            return e.buf;
+        }
+    }
+
+    ctx.q8_1_cache_misses++;
+
+    // Drop the oldest entries first, which are the ones furthest from any node
+    // still to be executed and so the least likely to be asked for again.
+    while (ctx.q8_1_cache.size() >= GGML_CUDA_Q8_1_CACHE_MAX_ENTRIES) {
+        ctx.q8_1_cache.erase(ctx.q8_1_cache.begin());
+    }
+
+    ggml_backend_cuda_context::q8_1_cache_entry e;
+    e.alloc     = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
+    e.buf       = e.alloc->get();
+    e.src1      = src1;
+    e.data      = src1->data;
+    e.ne[0]     = src1->ne[0];
+    e.ne[1]     = src1->ne[1];
+    e.ne[2]     = src1->ne[2];
+    e.ne[3]     = src1->ne[3];
+    e.stride[0] = s11;
+    e.stride[1] = s12;
+    e.stride[2] = s13;
+    e.ne_padded = ne_padded;
+    e.nbytes    = nbytes;
+    e.variant   = variant;
+
+    char * buf = e.buf;
+    ctx.q8_1_cache.push_back(std::move(e));
+    ctx.q8_1_cache_peak = std::max(ctx.q8_1_cache_peak, ctx.q8_1_cache.size());
+
+    return buf;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4723,6 +4821,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // entries are only valid within one graph evaluation
+    cuda_ctx->q8_1_cache_reset();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
