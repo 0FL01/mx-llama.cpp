@@ -1673,12 +1673,28 @@ static ggml_guid_t ggml_backend_meta_guid() {
 // Thread safety: ggml_cuda_set_device resolves the current device through cudaGetDevice,
 // which is thread-local in the CUDA/HIP runtime, and every per-lane backend owns its own
 // context, streams, graph cache and memory pool. Lanes therefore share no mutable state.
+static inline uint64_t ggml_meta_prof_now() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Accumulates into *acc for the lifetime of the scope. Used on graph_compute
+// and synchronize, both of which have many early returns.
+struct ggml_meta_prof_scope {
+    uint64_t * acc;
+    uint64_t   t0;
+    bool       on;
+    ggml_meta_prof_scope(uint64_t * a, bool o) : acc(a), t0(o ? ggml_meta_prof_now() : 0), on(o) {}
+    ~ggml_meta_prof_scope() { if (on) { *acc += ggml_meta_prof_now() - t0; } }
+};
+
 struct ggml_backend_meta_lane_dispatcher {
     struct job {
         ggml_backend_t backend = nullptr;
         ggml_cgraph *  cgraph  = nullptr;
         ggml_status    status  = GGML_STATUS_SUCCESS;
     };
+
 
     std::vector<std::thread> workers;
     std::vector<job>         jobs;
@@ -1853,6 +1869,70 @@ struct ggml_backend_meta_context {
     size_t                               n_stages = 1;
     std::vector<void *>                  comm_ctxs;       // size == n_stages; entry may be null if comm_init unavailable
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+
+    // Split AllReduce. comm_ar_prepare does the shared host setup and returns the
+    // number of ranks to issue, or < 0 when this call is not eligible (size gate
+    // to NCCL, non-F32, one-shot path), in which case the ordinary comm_allreduce
+    // path is used unchanged. Recording a whole token needs the split form: the
+    // ranks have to be issued from inside the capture, one lane at a time.
+    int  (*comm_ar_prepare)(void *, struct ggml_tensor **) = nullptr;
+    void (*comm_ar_launch_rank)(void *, int)               = nullptr;
+
+    // Whole-token graph capture. One recorded graph per lane, replayed each
+    // token, so the per-boundary host round trips (and the submission spread
+    // the barrier bills for them) collapse to one per token. On by default,
+    // GGML_META_TOKEN_GRAPH=0 goes back to per-subgraph dispatch.
+    bool token_graph = false;
+    bool (*tg_capture_begin)(ggml_backend_t)        = nullptr;
+    void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
+    void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
+    void (*tg_graph_free)(ggml_backend_t, void *)   = nullptr;
+    // One recorded graph set per cgraph shape. A server alternates shapes
+    // (prefill vs decode, slots joining and leaving), and a single-slot cache
+    // would reset its warmup on every switch and never capture at all.
+    struct tg_entry {
+        size_t              uid    = 0;
+        int                 warm   = 0;      // tokens seen on this shape
+        bool                failed = false;  // capture rejected: never retry
+        std::vector<void *> exec;            // one graph per lane
+    };
+    std::vector<tg_entry> tg_cache;
+    static const size_t   tg_cache_max = 8;
+
+    // The VRAM scratch pool still grows on the first few tokens, and device
+    // allocation is illegal inside a stream capture, so a shape must run
+    // normally a few times before it can be recorded, or capture aborts inside
+    // ggml_cuda_pool_leg::alloc.
+    static const int      tg_warm_needed = 4;
+
+    tg_entry * tg_lookup(size_t uid) {
+        for (auto & e : tg_cache) {
+            if (e.uid == uid) {
+                return &e;
+            }
+        }
+        if (tg_cache.size() >= tg_cache_max) {
+            // Evict the oldest entry, releasing its graphs.
+            tg_free_entry(tg_cache.front());
+            tg_cache.erase(tg_cache.begin());
+        }
+        tg_cache.push_back(tg_entry{});
+        tg_cache.back().uid = uid;
+        return &tg_cache.back();
+    }
+
+    void tg_free_entry(tg_entry & e) {
+        if (tg_graph_free == nullptr) {
+            e.exec.clear();
+            return;
+        }
+        for (size_t j = 0; j < e.exec.size(); j++) {
+            if (e.exec[j] != nullptr) {
+                tg_graph_free(backend_configs[j].backend, e.exec[j]);
+            }
+        }
+        e.exec.clear();
+    }
     void *                               xfer_comm_ctx = nullptr;
     ggml_backend_comm_sendrecv_tensor_t  comm_sendrecv = nullptr;
     bool                                 xfer_comm_default = false;
@@ -1891,6 +1971,41 @@ struct ggml_backend_meta_context {
     // staircase is rebuilt 80 times. Issuing the lanes concurrently removes it.
     bool parallel_dispatch = false;
     ggml_backend_meta_lane_dispatcher dispatcher;
+
+    // GGML_META_PROFILE=1: where a token's wall time actually goes.
+    // ns_compute is the whole graph_compute (pure host enqueue), of which
+    // ns_lanes is issuing the per-lane subgraphs and ns_close is the closure
+    // (AllReduce or stage transfer). ns_sync is the later wait on the GPU.
+    // host-bound shows up as ns_compute >> ns_sync.
+    bool     prof            = false;
+    uint64_t prof_calls      = 0;
+    uint64_t prof_subgraphs  = 0;
+    uint64_t prof_ns_compute = 0;
+    uint64_t prof_ns_lanes   = 0;
+    uint64_t prof_ns_close   = 0;
+    uint64_t prof_ns_sync    = 0;
+    uint64_t prof_ns_wall0   = 0;
+
+    void prof_report() const {
+        if (!prof || prof_calls == 0) {
+            return;
+        }
+        const double wall = (double) (ggml_meta_prof_now() - prof_ns_wall0);
+        const double c    = (double) prof_calls;
+        fprintf(stderr,
+            "[meta-prof] tps=%zu calls=%llu subgraphs/call=%.1f | per call: "
+            "compute=%.1f us (lanes=%.1f close=%.1f other=%.1f)  sync=%.1f us | "
+            "totals: compute=%.1f%% sync=%.1f%% of %.1f s wall\n",
+            tps, (unsigned long long) prof_calls, prof_subgraphs / c,
+            prof_ns_compute / c / 1e3,
+            prof_ns_lanes   / c / 1e3,
+            prof_ns_close   / c / 1e3,
+            (double)(prof_ns_compute - prof_ns_lanes - prof_ns_close) / c / 1e3,
+            prof_ns_sync    / c / 1e3,
+            100.0 * prof_ns_compute / wall,
+            100.0 * prof_ns_sync    / wall,
+            wall / 1e9);
+    }
 
     // Sync-fallback scratch for set_tensor_async on layouts the chunk-by-chunk path can't handle:
     // multi-segment splits, and PARTIAL axis (per-device 1/N scaling needs the whole tensor).
@@ -1947,6 +2062,18 @@ struct ggml_backend_meta_context {
                 comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_allreduce_tensor");
                 GGML_ASSERT(comm_allreduce != nullptr);
+                comm_ar_prepare = (int (*)(void *, struct ggml_tensor **))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_allreduce_prepare");
+                comm_ar_launch_rank = (void (*)(void *, int))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_allreduce_launch_rank");
+                tg_capture_begin = (bool (*)(ggml_backend_t))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_capture_begin");
+                tg_capture_end = (void * (*)(ggml_backend_t))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_capture_end");
+                tg_graph_launch = (void (*)(ggml_backend_t, void *))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_launch");
+                tg_graph_free = (void (*)(ggml_backend_t, void *))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_free");
                 break;
             }
         }
@@ -2029,7 +2156,14 @@ struct ggml_backend_meta_context {
         // streams, graph cache and pool. This meta backend wraps arbitrary
         // ggml_backend_dev_t, and concurrent graph_compute has not been verified for
         // Vulkan / SYCL / Metal / CPU sub-backends. Refuse rather than assume.
+        prof = env_flag("GGML_META_PROFILE");
+        if (prof) {
+            prof_ns_wall0 = ggml_meta_prof_now();
+        }
         parallel_dispatch = env_flag_on("GGML_META_PARALLEL_DISPATCH") && tps > 1;
+        // The recording loop issues each rank itself, on one thread, so this needs
+        // the split AllReduce entry points and the concurrent lane dispatch.
+        token_graph = env_flag_on("GGML_META_TOKEN_GRAPH") && parallel_dispatch;
         if (parallel_dispatch) {
             for (size_t i = 0; i < n_devs; i++) {
                 ggml_backend_dev_t d = ggml_backend_meta_dev_simple_dev(meta_dev, i);
@@ -2052,6 +2186,7 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        prof_report();
         ggml_backend_comm_free_t comm_free = nullptr;
         if (xfer_comm_ctx != nullptr) {
             comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
@@ -2264,6 +2399,8 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 }
 
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+    ggml_backend_meta_context * prof_ctx = (ggml_backend_meta_context *) backend->context;
+    ggml_meta_prof_scope prof_guard(&prof_ctx->prof_ns_sync, prof_ctx->prof);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
@@ -2274,6 +2411,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    ggml_meta_prof_scope prof_guard(&backend_ctx->prof_ns_compute, backend_ctx->prof);
+    backend_ctx->prof_calls += backend_ctx->prof ? 1 : 0;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -3000,6 +3139,114 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+    // ---- whole-token graph ------------------------------------------------
+    // One host round trip per lane per token instead of one per subgraph, so the
+    // spread the AllReduce barrier bills is paid once rather than at every
+    // subgraph boundary.
+    if (backend_ctx->token_graph && cgraph->uid != 0 &&
+        backend_ctx->tg_capture_begin != nullptr && backend_ctx->tg_capture_end != nullptr &&
+        backend_ctx->comm_ar_prepare != nullptr && backend_ctx->comm_ar_launch_rank != nullptr &&
+        backend_ctx->tps == n_backends && backend_ctx->tps > 1 &&
+        backend_ctx->comm_ctxs.size() > 0 && backend_ctx->comm_ctxs[0] != nullptr) {
+
+        auto * tge = backend_ctx->tg_lookup(cgraph->uid);
+
+        // Replay.
+        if (tge->exec.size() == n_backends) {
+            bool ready = true;
+            for (size_t j = 0; j < n_backends; j++) {
+                if (tge->exec[j] == nullptr) { ready = false; break; }
+            }
+            if (ready) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->tg_graph_launch(backend_ctx->backend_configs[j].backend, tge->exec[j]);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+
+        tge->warm++;
+
+        // Record, once this shape has run enough times for the scratch pool to
+        // stop growing. Only single-stage graphs whose every closure is an
+        // AllReduce (or the trailing NONE) qualify: a TRANSFER closure, or an
+        // AllReduce that falls back to NCCL on the size gate, needs the host
+        // mid-token and cannot be captured.
+        if (!tge->failed && tge->warm > backend_ctx->tg_warm_needed) {
+            bool eligible = true;
+            for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+                const auto & sg = backend_ctx->subgraphs[i];
+                if (sg.stage != 0 ||
+                    sg.closure == ggml_backend_meta_context::subgraph_closure::TRANSFER) {
+                    eligible = false;
+                    break;
+                }
+            }
+
+            if (!eligible) {
+                tge->failed = true;
+                GGML_LOG_DEBUG("%s: uid %zu not eligible for token graph "
+                               "(transfer closure or multi-stage)\n",
+                               __func__, (size_t) cgraph->uid);
+            } else {
+                backend_ctx->tg_free_entry(*tge);
+                tge->exec.assign(n_backends, nullptr);
+
+                bool ok = true;
+                std::vector<ggml_tensor *> nodes;
+                for (size_t j = 0; j < n_backends && ok; j++) {
+                    ggml_backend_t bj = backend_ctx->backend_configs[j].backend;
+                    ggml_backend_synchronize(bj);   // the stream must be quiet to enter capture
+                    if (!backend_ctx->tg_capture_begin(bj)) { ok = false; break; }
+
+                    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+                        const auto & sg = backend_ctx->subgraphs[i];
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        if (ggml_backend_graph_compute_async(bj, bcj.cgraphs[i].cgraph_main)
+                                != GGML_STATUS_SUCCESS) {
+                            ok = false; break;
+                        }
+                        if (sg.closure != ggml_backend_meta_context::subgraph_closure::AR) {
+                            continue;
+                        }
+                        nodes.clear();
+                        nodes.reserve(backend_ctx->tps);
+                        for (size_t k = 0; k < backend_ctx->tps; k++) {
+                            ggml_cgraph * cg = backend_ctx->backend_configs[k].cgraphs[i].cgraph_main;
+                            nodes.push_back(cg->nodes[cg->n_nodes - 1]);
+                        }
+                        const int nr = backend_ctx->comm_ar_prepare(backend_ctx->comm_ctxs[0], nodes.data());
+                        if (nr < 0) { ok = false; break; }
+                        if (nr > 0) {
+                            backend_ctx->comm_ar_launch_rank(backend_ctx->comm_ctxs[0], (int) j);
+                        }
+                    }
+
+                    void * exec = backend_ctx->tg_capture_end(bj);
+                    if (!ok || exec == nullptr) { ok = false; break; }
+                    tge->exec[j] = exec;
+                }
+
+                if (ok) {
+                    // Capture records without executing, so this token still runs.
+                    for (size_t j = 0; j < n_backends; j++) {
+                        backend_ctx->tg_graph_launch(backend_ctx->backend_configs[j].backend, tge->exec[j]);
+                    }
+                    GGML_LOG_DEBUG("%s: uid %zu captured %zu lanes x %zu subgraphs\n",
+                                   __func__, (size_t) cgraph->uid, n_backends,
+                                   backend_ctx->n_subgraphs);
+                    return GGML_STATUS_SUCCESS;
+                }
+
+                tge->failed = true;
+                backend_ctx->tg_free_entry(*tge);
+                GGML_LOG_DEBUG("%s: uid %zu capture failed, using per-subgraph dispatch\n",
+                               __func__, (size_t) cgraph->uid);
+            }
+        }
+    }
+    // ------------------------------------------------------------------------
+
     const bool run_debug = backend_ctx->dbg_run;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const auto & sg      = backend_ctx->subgraphs[i];
@@ -3013,6 +3260,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             fprintf(stderr, "[run] sg%zu stage=%zu lanes=[%zu,%zu) n_nodes=%d first=%s last=%s closure=%d\n",
                     i, stage, lane_lo, lane_hi, cg0->n_nodes, first, last, (int) sg.closure);
         }
+        const uint64_t prof_t0 = backend_ctx->prof ? ggml_meta_prof_now() : 0;
+
         // Issuing the lanes in order makes lane_hi-1 arrive at the closure below last, and
         // the AllReduce bills that wait as its own runtime. Hand the trailing lanes to the
         // worker pool so every lane starts together, and keep lane_lo on this thread.
@@ -3039,6 +3288,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (status_workers != GGML_STATUS_SUCCESS) {
                 return status_workers;
             }
+
         } else {
             for (size_t j = lane_lo; j < lane_hi; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
@@ -3049,6 +3299,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        const uint64_t prof_t1 = backend_ctx->prof ? ggml_meta_prof_now() : 0;
         if (sg.closure == ggml_backend_meta_context::subgraph_closure::AR && backend_ctx->tps > 1) {
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctxs[stage] != nullptr) {
@@ -3075,6 +3326,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+        }
+        if (backend_ctx->prof) {
+            const uint64_t prof_t2 = ggml_meta_prof_now();
+            backend_ctx->prof_ns_lanes += prof_t1 - prof_t0;
+            backend_ctx->prof_ns_close += prof_t2 - prof_t1;
+            backend_ctx->prof_subgraphs++;
         }
         // closure == NONE: last subgraph, no closure action.
     }
