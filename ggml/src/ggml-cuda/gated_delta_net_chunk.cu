@@ -1,7 +1,7 @@
 #include "gated_delta_net_chunk.cuh"
 #include "ggml-cuda/common.cuh"
 
-#if defined(GGML_USE_HIP) && defined(GCN)
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
 
 #define GDN_GCN_DPP_ADD(name, barrier, dpp_ctrl)                                \
     static __device__ __forceinline__ float name(const float x) {               \
