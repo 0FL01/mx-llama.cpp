@@ -2906,8 +2906,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const char * env = getenv("GGML_META_TOPK_BCAST");
                     return env == nullptr || atoi(env) != 0;
                 }();
+                // A TOP_K whose scores came from the fused lightning indexer
+                // needs no broadcast: the scores are AllReduce outputs, which
+                // are bit-identical on every lane by construction, so the
+                // per-lane bitonic selection already agrees. Only the unfused
+                // path (per-lane mirrored score compute, lane-local reduce
+                // ordering) can disagree on near-ties.
                 const bool bcast_close = topk_bcast && backend_ctx->tps > 1 &&
-                    node->op == GGML_OP_TOP_K;
+                    node->op == GGML_OP_TOP_K &&
+                    !(node->src[0] != nullptr && node->src[0]->op == GGML_OP_LIGHTNING_INDEXER);
                 const bool end_close = (i + 1 == cgraph->n_nodes);
                 if (!ar_close && !bcast_close && !end_close) {
                     continue;
