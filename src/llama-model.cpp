@@ -1959,7 +1959,12 @@ const float * llama_model::tensor_split() const {
 }
 
 bool llama_model::tensor_mirror_output() const {
-    return params.tensor_mirror_output;
+    // Internal bridge instead of a public llama_model_params field. The one
+    // consumer that needs a replicated output projection under tensor split
+    // (the DSpark drafter's in-graph vocabulary-global argmax) sets this in
+    // common_model_params_to_llama before the model loads.
+    const char * env = getenv("LLAMA_TENSOR_MIRROR_OUTPUT");
+    return env != nullptr && atoi(env) != 0;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -2687,7 +2692,6 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.tensor_mirror_output        =*/ false,
     };
 
     return result;
