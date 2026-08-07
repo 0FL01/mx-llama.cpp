@@ -342,6 +342,12 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // when split_mode == LLAMA_SPLIT_MODE_TENSOR, replicate the output projection on
+        // every device instead of sharding it by vocabulary. Costs one full copy of the
+        // output matrix per device and is only needed by consumers that run a
+        // vocabulary-global op on the logits inside the graph, see llama-model.cpp
+        bool tensor_mirror_output;
     };
 
     struct llama_sampler_seq_config {

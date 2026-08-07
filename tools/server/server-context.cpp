@@ -304,7 +304,10 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
-    llama_token sampled; // in speculative mode, this is the last accepted token
+    // in speculative mode, this is the last accepted token. LLAMA_TOKEN_NULL until
+    // the first token of the task is sampled - drafting must not start before then
+    // (a null anchor reaches the draft graph as get_rows index -1)
+    llama_token sampled = LLAMA_TOKEN_NULL;
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
     // corresponding to one token position (size = n_embd)
@@ -2888,6 +2891,22 @@ private:
         }
     }
 
+    // LLAMA_SPEC_CRASH_FENCE=1: synchronize both contexts and log after each
+    // spec checkpoint operation, so an asynchronously-detected illegal access
+    // surfaces at a named fence instead of at a later unrelated synchronize.
+    void spec_crash_fence(const char * where) {
+        static const bool fence = getenv("LLAMA_SPEC_CRASH_FENCE") != nullptr;
+        if (!fence) {
+            return;
+        }
+        SRV_INF("spec-fence: before sync at %s\n", where);
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+        SRV_INF("spec-fence: passed %s\n", where);
+    }
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -2985,7 +3004,10 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max();
 
-                if (n_draft_max > 0) {
+                // with the deferred sampling of chunked prefill, a slot can reach
+                // pre_decode before its first token was sampled - no anchor to
+                // draft from yet, skip this iteration
+                if (n_draft_max > 0 && slot.sampled != LLAMA_TOKEN_NULL) {
                     GGML_ASSERT(slot.can_speculate());
 
                     if (!slot.spec_draft.empty()) {
@@ -3002,7 +3024,9 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            spec_crash_fence("pre update_dft");
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            spec_crash_fence("post update_dft");
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3024,7 +3048,9 @@ private:
 
         // generate the actual drafts (if any)
         {
+            spec_crash_fence("pre draft");
             common_speculative_draft(spec.get());
+            spec_crash_fence("post draft");
         }
 
         // make checkpoints if needed
@@ -3040,11 +3066,13 @@ private:
             if (ctx_dft) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    spec_crash_fence("post load_dft");
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
+                spec_crash_fence("post dft seq_rm");
             }
 
             if (!draft.empty()) {
@@ -3058,7 +3086,9 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    spec_crash_fence("pre update_tgt");
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    spec_crash_fence("post update_tgt");
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3636,7 +3666,36 @@ private:
             }
         }
 
+        // LLAMA_TGT_DECODE_TIMING=1: the last unmeasured box in the speculative prefill.
+        // Attaching a DFlash drafter costs 3.1 s of prefill on an 1800 token prompt, of
+        // which the drafter's own phases account for 0.51 s and the wait for the target
+        // 2.85 s. Time the target's decode itself, split by prompt-sized and decode-sized
+        // batches, so "the target got slower" can be confirmed rather than inferred.
+        static const bool tgt_timing = getenv("LLAMA_TGT_DECODE_TIMING") != nullptr;
+        static int64_t t_tgt_pp_us = 0, t_tgt_tg_us = 0;
+        static int64_t t_drain_pp_us = 0, t_drain_tg_us = 0;
+        static int64_t n_tgt_pp = 0, n_tgt_tg = 0;
+        const int64_t t_tgt_beg = tgt_timing ? ggml_time_us() : 0;
+
         const int ret = llama_decode(ctx_tgt, batch_view);
+
+        if (tgt_timing) {
+            const int64_t dt = ggml_time_us() - t_tgt_beg;
+            // llama_decode returns before the GPU is done, and the bulk of the cost
+            // measured so far is in that outstanding work. Draining it here attributes
+            // it, and works for runs where no drafter survives to report its own wait.
+            const int64_t t_drain_beg = ggml_time_us();
+            llama_synchronize(ctx_tgt);
+            const int64_t dt_drain = ggml_time_us() - t_drain_beg;
+            if (batch_view.n_tokens >= 64) {
+                t_tgt_pp_us += dt; t_drain_pp_us += dt_drain; n_tgt_pp++;
+            } else {
+                t_tgt_tg_us += dt; t_drain_tg_us += dt_drain; n_tgt_tg++;
+            }
+            SRV_INF("tgt_decode: pp %.1f + drain %.1f ms over %lld calls, tg %.1f + drain %.1f ms over %lld calls\n",
+                    t_tgt_pp_us / 1000.0, t_drain_pp_us / 1000.0, (long long) n_tgt_pp,
+                    t_tgt_tg_us / 1000.0, t_drain_tg_us / 1000.0, (long long) n_tgt_tg);
+        }
 
         metrics.on_decoded(slots);
 
