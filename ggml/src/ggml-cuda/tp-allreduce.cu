@@ -61,11 +61,15 @@ static __device__ __forceinline__ void barrier_end(
     __syncthreads();
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if (threadIdx.x < NRANKS) {
-        *reinterpret_cast<volatile FlagType *>(&sg.signals[threadIdx.x]->end[blockIdx.x][rank]) = flag;
-        FlagType val;
-        do {
-            val = *reinterpret_cast<volatile FlagType *>(&self_sg->end[blockIdx.x][threadIdx.x]);
-        } while (val != flag);
+        // Release/acquire like barrier_start. The raw volatile store this
+        // replaces did not order the preceding payload peer-writes before the
+        // cross-device flag store, so under 8-way PCIe contention a peer could
+        // observe the flag before the data - torn gathers, measured as
+        // reproducible collapse at 8 ranks / 100k context while 4 ranks won
+        // the race.
+        st_flag_volatile(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag);
+        while (ld_flag_volatile(&self_sg->end[blockIdx.x][threadIdx.x]) != flag)
+            ;
     }
     if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
 }
