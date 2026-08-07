@@ -1515,19 +1515,7 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    // The custom peer-write AllReduce is validated bit-exact up to 4 ranks
-    // (tps4). At 8 ranks its results diverge per lane at depth - measured as
-    // coherent output twice on the NCCL path versus reproducible collapse on
-    // the custom path at 100k context - most likely the peer-write signal
-    // protocol racing under 8-way PCIe contention. Route wide groups to the
-    // NCCL ring, which is lane-consistent by construction.
-    // GGML_CUSTOM_AR_MAX_RANKS overrides for experiments.
-    static const size_t max_ranks = []() {
-        const char * env = getenv("GGML_CUSTOM_AR_MAX_RANKS");
-        return env != nullptr ? (size_t) atoll(env) : (size_t) 4;
-    }();
-    if (comm_ctx->backends.size() <= max_ranks &&
-        ggml_backend_cuda_comm_allreduce_custom(comm_ctx, tensors)) {
+    if (ggml_backend_cuda_comm_allreduce_custom(comm_ctx, tensors)) {
         return true;
     }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
