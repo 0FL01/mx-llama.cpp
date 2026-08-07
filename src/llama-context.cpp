@@ -19,6 +19,16 @@
 #include <stdexcept>
 #include <string>
 
+// LLAMA_SYNC_TRACE=1 tags every path that can drain the scheduler.
+static bool llama_sync_trace() {
+    static const bool on = []() {
+        const char * env = getenv("LLAMA_SYNC_TRACE");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+
 //
 // llama_context
 //
@@ -491,6 +501,7 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
     synchronize();
 
     layer_inp_accum_events_free();
@@ -577,8 +588,20 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_flid) {
-        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
-        resolve(llm_fused_op_lid_probe, cparams.fused_lid);
+        // LLAMA_NO_FUSED_LID=1: force the unfused lightning-indexer graph. The
+        // fused op adds the mask per lane before the partial-sum AllReduce and
+        // uses an F16 mask input, the unfused graph masks once after the
+        // reduce with an F32 mask - an A/B that separates fused-op handling
+        // from mask-input distribution under multi-stage tensor parallel.
+        static const bool no_fused_lid = getenv("LLAMA_NO_FUSED_LID") != nullptr
+            && atoi(getenv("LLAMA_NO_FUSED_LID")) != 0;
+        if (no_fused_lid) {
+            cparams.fused_lid = false;
+            LLAMA_LOG_WARN("%s: fused Lightning Indexer disabled by LLAMA_NO_FUSED_LID\n", func);
+        } else {
+            LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
+            resolve(llm_fused_op_lid_probe, cparams.fused_lid);
+        }
         cparams.auto_flid = false;
     }
 
@@ -600,6 +623,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
     synchronize();
 
     const int64_t t_start_us = ggml_time_us();
@@ -765,6 +789,9 @@ void llama_context::synchronize() {
         return;
     }
 
+    if (llama_sync_trace()) {
+        fprintf(stderr, "[sync-tag] ctx-synchronize\n");
+    }
     ggml_backend_sched_synchronize(sched.get());
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1281,6 +1308,7 @@ float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
 }
 
 float * llama_context::get_embeddings_pre_norm_accum() {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
     synchronize();
     return embd_pre_norm_accum;
 }
@@ -1535,7 +1563,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // LLAMA_REUSE_NO_DRAIN=1: skip this drain. The scheduler stages graph
+        // inputs through per-copy pinned buffers guarded by events, and the
+        // reused graph's kernels are stream-ordered behind the in-flight
+        // graph on every lane, so the overwrite hazard this drain guards
+        // against is already handled for staged inputs. Experimental gate to
+        // measure cross-chunk prefill overlap.
+        static const bool reuse_no_drain = []() {
+            const char * env = getenv("LLAMA_REUSE_NO_DRAIN");
+            return env && atoi(env) != 0;
+        }();
+        if (cparams.pipeline_parallel && !reuse_no_drain) {
+            if (llama_sync_trace()) {
+                fprintf(stderr, "[sync-tag] reuse-set-inputs\n");
+            }
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -1621,6 +1662,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
+        if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
         synchronize();
     }
     embd_seq.clear();
@@ -1748,6 +1790,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
 
+        if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
         synchronize();
 
         cross.n_embd = t_embd->ne[0];
@@ -1971,6 +2014,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
+        if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
         synchronize();
     }
     embd_seq.clear();
@@ -2225,6 +2269,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         // the prefill pipelining within each ring-sized window.
                         const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
                         if (n_copies > 1 && (++embd_pre_norm_accum_ub % n_copies) == 0) {
+                            if (llama_sync_trace()) {
+                                fprintf(stderr, "[sync-tag] accum-ring\n");
+                            }
                             ggml_backend_sched_synchronize(sched.get());
                         }
                     }
@@ -2379,6 +2426,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
+            if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] int:%s\n", __func__); }
             synchronize();
 
             // TODO: not needed?
@@ -4008,16 +4056,19 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 }
 
 float * llama_get_logits(llama_context * ctx) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     float * res = nullptr;
@@ -4032,18 +4083,21 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
@@ -4098,18 +4152,21 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
@@ -4120,42 +4177,49 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
@@ -4337,6 +4401,7 @@ size_t llama_state_get_size(llama_context * ctx) {
 }
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->state_get_data(dst, size);
@@ -4344,12 +4409,14 @@ size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->state_set_data(src, size);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     try {
@@ -4361,6 +4428,7 @@ bool llama_state_load_file(llama_context * ctx, const char * path_session, llama
 }
 
 bool llama_state_save_file(llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     try {
@@ -4388,17 +4456,20 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     try {
@@ -4410,6 +4481,7 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (llama_sync_trace()) { fprintf(stderr, "[sync-tag] api:%s\n", __func__); }
     ctx->synchronize();
 
     try {

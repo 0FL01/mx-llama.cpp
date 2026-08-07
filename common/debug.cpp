@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstring>
 #include <regex>
 #include <string>
 #include <vector>
@@ -148,6 +149,85 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src1 = t->src[1];
 
     if (ask) {
+        // GGML_DEBUG_SKIP_PASSES=N / GGML_DEBUG_MAX_PASSES=M: only observe graph
+        // passes in [N, M]. A pass is one full walk over the graph, detected by
+        // re-seeing the first tensor ever asked about (graph reuse keeps node
+        // pointers stable across passes). Lets a long-context bisect dump only
+        // the generation steps around a corruption boundary.
+        static const long skip_passes = []() {
+            const char * env = getenv("GGML_DEBUG_SKIP_PASSES");
+            return env ? atol(env) : 0L;
+        }();
+        static const long max_passes = []() {
+            const char * env = getenv("GGML_DEBUG_MAX_PASSES");
+            return env ? atol(env) : 0L;
+        }();
+        // GGML_DEBUG_ASK_TRACE=N: log the first N asked node names to find a
+        // stable per-pass sentinel name.
+        static long ask_trace = []() {
+            const char * env = getenv("GGML_DEBUG_ASK_TRACE");
+            return env ? atol(env) : 0L;
+        }();
+        if (ask_trace > 0) {
+            ask_trace--;
+            LOG("asktrace %s op=%s ne=[%lld,%lld]\n", t->name, ggml_op_desc(t),
+                (long long) t->ne[0], (long long) t->ne[1]);
+        }
+        // Match the sentinel by NAME: a graph rebuild (prefill -> decode shape
+        // change) allocates new tensor structs, so pointers do not survive, but
+        // node names are builder-assigned and stable. GGML_DEBUG_PASS_SENTINEL
+        // overrides the default (first asked name) when that name does not recur
+        // in later graphs.
+        static const char * env_sentinel = getenv("GGML_DEBUG_PASS_SENTINEL");
+        static std::string pass_sentinel;
+        static long pass_count = 0;
+        if (skip_passes > 0 || max_passes > 0) {
+            if (pass_sentinel.empty()) {
+                pass_sentinel = env_sentinel ? env_sentinel : t->name;
+                pass_count    = 0;
+                LOG("common_debug_cb_eval: pass window [%ld, %ld], sentinel %s\n",
+                    skip_passes, max_passes > 0 ? max_passes : -1, pass_sentinel.c_str());
+            }
+            if (pass_sentinel == t->name) {
+                pass_count++;
+                if (pass_count >= skip_passes && (max_passes <= 0 || pass_count <= max_passes)) {
+                    LOG("common_debug_cb_eval: === pass %ld ===\n", pass_count);
+                }
+            }
+            if (pass_count < skip_passes) {
+                return false;
+            }
+            if (max_passes > 0 && pass_count > max_passes) {
+                return false;
+            }
+        }
+        // GGML_DEBUG_ONLY_NAME=substr: observe only nodes whose name contains
+        // the substring. Turns a full-graph dump into a single-tensor probe.
+        static const char * only_name = getenv("GGML_DEBUG_ONLY_NAME");
+        if (only_name != nullptr && strstr(t->name, only_name) == nullptr) {
+            return false;
+        }
+        // GGML_DEBUG_SKIP_NE1=N: skip tensors with ne[1] > N entirely (no
+        // readback, no print). Lets a debug run dump per-token decode graphs
+        // while skipping the prompt-sized prefill tensors whose per-node
+        // readback would otherwise dominate the run.
+        static const int64_t skip_ne1 = []() {
+            const char * env = getenv("GGML_DEBUG_SKIP_NE1");
+            return env ? atoll(env) : (int64_t) 0;
+        }();
+        if (skip_ne1 > 0 && t->ne[1] > skip_ne1) {
+            return false;
+        }
+        // GGML_DEBUG_SKIP_NONCONT=1: skip non-contiguous tensors. The meta
+        // backend cannot gather non-contiguous axis-split tensors (asserts),
+        // and their contiguous successors carry the same information.
+        static const bool skip_noncont = []() {
+            const char * env = getenv("GGML_DEBUG_SKIP_NONCONT");
+            return env && atoi(env) != 0;
+        }();
+        if (skip_noncont && !ggml_is_contiguous(t)) {
+            return false;
+        }
         return true;  // Always retrieve data
     }
 
@@ -183,7 +263,37 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        // GGML_DEBUG_SUM_ONLY=1: one line per node (sum + finite-count) instead of
+        // the value excerpt. Cuts a per-node dump by 10-50x so a bisect can afford
+        // to observe many generation passes.
+        static const bool sum_only = []() {
+            const char * env = getenv("GGML_DEBUG_SUM_ONLY");
+            return env && atoi(env) != 0;
+        }();
+        if (sum_only) {
+            double sum = 0.0;
+            double asum = 0.0;
+            int64_t n_nonfinite = 0;
+            for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+                for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                        for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
+                            const float v = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, i2, i3);
+                            if (!std::isfinite(v)) {
+                                n_nonfinite++;
+                                continue;
+                            }
+                            sum  += v;
+                            asum += std::fabs(v);
+                        }
+                    }
+                }
+            }
+            LOG("sumline %s sum=%.6f asum=%.6f nonfinite=%lld\n",
+                t->name, sum, asum, (long long) n_nonfinite);
+        } else {
+            common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        }
     }
 
     return true;

@@ -5909,6 +5909,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+#ifndef GGML_CUDA_USE_CUB
+            // Above the 16384-column shared-memory bitonic limit the
+            // hierarchical two-pass selection runs: per-segment bitonic top-k
+            // plus a candidate merge of n_seg * k entries, valid while that
+            // merge itself fits the bitonic. The CPU fallback this replaces
+            // fractured the graph into per-csa-layer host round-trips at
+            // n_kv = 65536 (the DSV4 indexer scores are n_kv/4 wide), which
+            // broke multi-stage -sm tensor and serialized prefill.
+            return op->src[0]->ne[0] <= 16384 ||
+                   ((op->src[0]->ne[0] + 16383)/16384) * op->ne[0] <= 16384;
+#else
+            return true;
+#endif
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             // strided bitonic kernel bound: ncols_pad ints of shared memory

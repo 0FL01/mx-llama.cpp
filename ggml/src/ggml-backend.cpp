@@ -1085,6 +1085,18 @@ static size_t ggml_backend_sched_input_staging_type_max_size(ggml_backend_t back
             return max_size != (size_t) -1 ? max_size :
                 (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 4096 : (size_t) 0);
         }
+        case GGML_TYPE_F16: {
+            // f16 kq masks are the largest per-ubatch inputs (n_kv x n_ubatch).
+            // The unstaged fallback copies them synchronously, which blocks the
+            // host on the lane stream behind the whole in-flight graph and
+            // serializes prefill chunks. Stage them like the other inputs.
+            static const size_t max_size = []() {
+                const char * env = getenv("GGML_SCHED_INPUT_STAGING_F16_MAX");
+                return env != nullptr ? (size_t) atoll(env) : (size_t) -1;
+            }();
+            return max_size != (size_t) -1 ? max_size :
+                (ggml_backend_sched_backend_is_multi_meta(backend) ? (size_t) 512*1024*1024 : (size_t) 0);
+        }
         default:
             return 0;
     }
@@ -1794,11 +1806,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    static const bool ids_trace = []() {
+        const char * env = getenv("GGML_SCHED_IDS_TRACE");
+        return env && atoi(env) != 0;
+    }();
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            if (ids_trace) {
+                fprintf(stderr, "[ids] node %d (%s) backend %d -> %d\n", i,
+                        sched->graph.nodes[i] ? sched->graph.nodes[i]->name : "?",
+                        sched->prev_node_backend_ids[i], sched->node_backend_ids[i]);
+            }
             break;
         }
     }
@@ -1807,9 +1828,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
+                if (ids_trace) {
+                    fprintf(stderr, "[ids] leaf %d (%s) backend %d -> %d\n", i,
+                            sched->graph.leafs[i] ? sched->graph.leafs[i]->name : "?",
+                            sched->prev_leaf_backend_ids[i], sched->leaf_backend_ids[i]);
+                }
                 break;
             }
         }
+    }
+    if (ids_trace && !backend_ids_changed) {
+        fprintf(stderr, "[ids] unchanged (n_nodes=%d n_leafs=%d)\n", sched->graph.n_nodes, sched->graph.n_leafs);
     }
 
     // allocate graph

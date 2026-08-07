@@ -3605,6 +3605,22 @@ private:
                         if (!is_user_start && !near_prompt_end) {
                             do_checkpoint = false;
                         }
+
+                        // LLAMA_NO_MIDPROMPT_CKPT=1: skip ALL mid-prompt checkpoints.
+                        // llama_state_seq_get_data_ext drains the whole scheduler
+                        // pipeline, so every mid-prompt checkpoint serializes the
+                        // prefill rounds (measured 0.7-2.1 s per checkpoint on 8-GPU
+                        // -sm tensor, the drain tagged via LLAMA_SYNC_TRACE). The
+                        // near-prompt-end checkpoint is preserved - it is the one
+                        // that enables decode-time rollback. Mid-prompt checkpoints
+                        // only speed up partial prompt-cache reuse across requests.
+                        static const bool no_mid_ckpt = []() {
+                            const char * env = getenv("LLAMA_NO_MIDPROMPT_CKPT");
+                            return env && atoi(env) != 0;
+                        }();
+                        if (no_mid_ckpt && !near_prompt_end) {
+                            do_checkpoint = false;
+                        }
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
