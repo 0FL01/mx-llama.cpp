@@ -3804,18 +3804,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (sg.stage != cur.stage) {
                         // A stage change without an intervening transfer is a shape this
                         // pass does not model. Fall back rather than capture it wrong.
+                        // `open` must drop with the runs: the push after this loop would
+                        // otherwise resurrect the partial run and replay would silently
+                        // skip every subgraph past it.
                         runs.clear();
+                        open = false;
                         break;
                     }
                     cur.i_end = i + 1;
                     if (sg.closure == ggml_backend_meta_context::subgraph_closure::BCAST) {
                         // The broadcast is a host-side copy that capture cannot
-                        // record - fall back to per-subgraph dispatch.
+                        // record - fall back to per-subgraph dispatch. Same rule as
+                        // above: close the run or the post-loop push turns this
+                        // rejection into a partial capture that truncates the token.
                         runs.clear();
+                        open = false;
                         break;
                     }
                     if (sg.closure == ggml_backend_meta_context::subgraph_closure::TRANSFER) {
-                        if (i + 1 >= backend_ctx->n_subgraphs) { runs.clear(); break; }
+                        if (i + 1 >= backend_ctx->n_subgraphs) { runs.clear(); open = false; break; }
                         cur.i_end    = i;          // the transfer subgraph is not captured
                         cur.i_closure = i;
                         cur.transfer = true;
