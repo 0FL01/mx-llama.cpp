@@ -657,6 +657,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
+        // Contraction-axis split against a mirrored input: src0 owns a slice of the
+        // reduced dimension while src1 holds all of it, so each device can reduce over its
+        // own slice and the result is a partial sum. Used to split deepseek4's
+        // hyper-connection mix projection, whose output is only [24, n_tokens] so the
+        // all-reduce it owes is negligible.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // Batched matmul against a BROADCAST shared operand: src0 is mirrored with a
+        // singleton batch (deepseek4's shared indexer KV) while src1 carries a head split
+        // on a batch axis. Each device matmuls only its own heads against the shared
+        // operand, so the result keeps src1's split and owes no reduction.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_3)) {
+            GGML_ASSERT(tensor->src[0]->ne[src_ss[1].axis] == 1);
+            return src_ss[1];
+        }
+        // Batched matmul with both operands split the same way on a BATCH dimension: each
+        // device owns whole batches and reduces only within them, so the batch matmuls are
+        // independent and nothing is owed. This is deepseek4's grouped LoRA output
+        // projection, where a device's attention heads are exactly its output groups.
+        if (src_ss[0].axis == src_ss[1].axis &&
+                (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3)) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            return src_ss[0];
+        }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
@@ -812,9 +839,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Design A: fully replicated attention, every device runs it identically -> MIRRORED.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        // MLA/MQA head-split: Q is head-split while the single shared KV latent stays MIRRORED.
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
@@ -989,7 +1025,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_rope(src_ss);
             } break;
             case GGML_OP_ROPE_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                // Same data layout and per-head independence as the forward rope, so it
+                // carries a head split identically. It was scalar_only only because no
+                // arch had yet fed it split data - deepseek4's de-rope of the attention
+                // output does, under the MLA head split.
+                split_state = handle_rope(src_ss);
             } break;
             case GGML_OP_CLAMP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -1056,7 +1096,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST: {
+                // DeepSeek-V4 custom attention ops. Replicated under design A (mirrored in, mirrored out).
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_LIGHTNING_INDEXER: {
+                // Head-split indexer: q (src0) carries the head split and the per-head
+                // weights (src2) carry it with them, while the shared compressor KV and the
+                // mask stay MIRRORED. The op reduces its score over heads internally, so
+                // each device ends up with a partial sum that owes an all-reduce before
+                // top_k selects. Design A keeps everything mirrored and takes the branch
+                // below unchanged.
+                if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                        src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                    GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED
+                                               : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+                } else {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                }
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -1113,8 +1170,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
                         }
-                        GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
-                                                                 == sum * tensor->ne[split_state.axis]);
+                        const int64_t ratio_lhs = split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis];
+                        const int64_t ratio_rhs = sum * tensor->ne[split_state.axis];
+                        if (ratio_lhs != ratio_rhs) {
+                            GGML_LOG_ERROR(
+                                "META SPLIT RATIO MISMATCH: node '%s' op=%s axis=%d ne[axis]=%lld dev=%zu ne=%lld nr=%u"
+                                " | src%zu '%s' axis=%d ne[axis]=%lld sum=%lld | lhs=%lld rhs=%lld\n",
+                                tensor->name, ggml_op_name(tensor->op), (int) split_state.axis,
+                                (long long) tensor->ne[split_state.axis], j,
+                                (long long) split_state.ne[j], split_state.nr[0],
+                                i, tensor->src[i]->name, (int) src_ss[i].axis,
+                                (long long) tensor->src[i]->ne[src_ss[i].axis], (long long) sum,
+                                (long long) ratio_lhs, (long long) ratio_rhs);
+                        }
+                        GGML_ASSERT(ratio_lhs == ratio_rhs);
                     }
                 }
                 first_src_split_by_axis = false;
@@ -1320,6 +1389,56 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+}
+
+static void ggml_backend_meta_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    // uniform byte value, so no per-device data to splice - just map the byte range each
+    // simple tensor covers and memset it (MIRRORED covers the DSV4 compressed-cache clear).
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        GGML_ABORT("meta memset_tensor: segmented split not implemented");
+    }
+
+    switch (split_state.axis) {
+        case GGML_BACKEND_SPLIT_AXIS_0:
+        case GGML_BACKEND_SPLIT_AXIS_1:
+        case GGML_BACKEND_SPLIT_AXIS_2: {
+            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            GGML_ASSERT(offset % chunk_size_full == 0);
+            GGML_ASSERT(size   % chunk_size_full == 0);
+            const int64_t i_start =  offset        /chunk_size_full;
+            const int64_t i_stop  = (offset + size)/chunk_size_full;
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                if (chunk_size_j == 0) {
+                    continue;
+                }
+                // each simple tensor is contiguous, so its target chunks are packed
+                ggml_backend_tensor_memset(simple_tensor, value, i_start*chunk_size_j, (i_stop - i_start)*chunk_size_j);
+            }
+        } break;
+        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                ggml_backend_tensor_memset(simple_tensor, value, offset, size);
+            }
+        } break;
+        case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            // a partial-sum tensor only round-trips a memset when clearing to zero
+            GGML_ASSERT(value == 0);
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                ggml_backend_tensor_memset(simple_tensor, value, offset, size);
+            }
+        } break;
+        default: {
+            GGML_ABORT("fatal error");
+        }
+    }
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -1555,7 +1674,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ nullptr, // TODO implement
+    /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,

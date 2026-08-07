@@ -357,6 +357,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
+    // MLA (deepseek) design-B head-split routing, see head_split_attention below
+    static const std::regex pattern_mla_q_b         ("blk\\.\\d*\\.attn_q_b.weight");
+    static const std::regex pattern_mla_out_a       ("blk\\.\\d*\\.attn_output_a.weight");
+    static const std::regex pattern_mla_out_b       ("blk\\.\\d*\\.attn_output_b.weight");
+
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
@@ -430,7 +435,100 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // Design A: replicate the attention, split only the experts/FFN. See
+    // llm_arch_sm_tensor_replicates_attention.
+    const bool replicate_attention = llm_arch_sm_tensor_replicates_attention(ud->model->arch);
+
+    // Head-split the MLA attention instead of replicating it, so each device computes
+    // n_head/n_devices heads rather than all of them. The KV latent is a single head (head_count_kv == 1) and stays MIRRORED
+    // either way, so this distributes attention COMPUTE, not the KV cache.
+    //
+    // Routing follows vLLM DeepseekV2MLAAttention:
+    //   q_a / q_a_norm / kv / kv_a_norm -> ReplicatedLinear -> MIRRORED (fall through)
+    //   q_b                             -> ColumnParallel   -> AXIS_1, head-splits Q
+    //   attn_sinks                      -> per head         -> AXIS_0
+    // DeepSeek-V4's output projection is a GROUPED LoRA: wo_a is applied per output
+    // group and wo_b reduces the concatenated groups. With n_head/n_devices heads per
+    // device the head split lands exactly on group boundaries, so a device owns whole
+    // groups. That makes wo_a a group-axis split (AXIS_1, a concatenation, no reduce)
+    // and wo_b the row-parallel step that produces PARTIAL and owes the all-reduce.
+    // On by default. LLAMA_MLA_TP=0 falls back to mirroring the whole attention stack
+    // and splitting only the experts, which is correct but leaves the attention mass
+    // replicated on every device.
+    static const bool mla_tp_env = [] {
+        const char * s = getenv("LLAMA_MLA_TP");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    // DEEPSEEK4 only for now. The routing below keys off V4's GROUPED LoRA output
+    // (attn_output_a/attn_output_b). DEEPSEEK2/32 have a plain attn_output.weight that
+    // matches none of those rules, so they would fall through to the design-A mirror and
+    // silently compute a wrong result instead of failing. They also have a kv_b
+    // up-projection that needs its own head-split rule. Add both before widening this.
+    const bool head_split_attention = mla_tp_env && replicate_attention &&
+                                      ud->model->arch == LLM_ARCH_DEEPSEEK4;
+    if (mla_tp_env && replicate_attention && !head_split_attention) {
+        LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4, using design A\n", __func__);
+    }
+    if (head_split_attention) {
+        // A device must own whole output groups for the wo_a group split to be valid, and
+        // whole heads for the Q split. Both constraints are on the TP GROUP WIDTH, not on
+        // the total device count - n_devices is every device under the Meta device, and
+        // the group is n_devices/n_stages (see the tps computation further down). Checking
+        // the total instead would wrongly reject e.g. 6 or 10 GPUs at -tps 2, which are
+        // perfectly valid (3 or 5 pipeline stages of a 2-wide group).
+        const size_t tp_width = ud->n_stages > 0 ? ud->n_devices / ud->n_stages : ud->n_devices;
+        GGML_ASSERT(tp_width > 0 && hparams.dsv4_o_group_count % tp_width == 0 &&
+                    "LLAMA_MLA_TP needs the TP group width to divide the output group count");
+        GGML_ASSERT(hparams.n_head() % tp_width == 0 &&
+                    "LLAMA_MLA_TP needs the TP group width to divide the head count");
+    }
+
     auto get_tensor_config = [&]() -> tensor_config {
+        if (head_split_attention) {
+            if (std::regex_match(tensor_name, pattern_mla_q_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (std::regex_match(tensor_name, pattern_mla_out_a)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            if (std::regex_match(tensor_name, pattern_mla_out_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            // Two further splits were tried on V4's attention side and neither ships.
+            //
+            // The sparse indexer head-split: its per-head scores combine with sum_rows,
+            // so a split leaves a PARTIAL whose all-reduce carries the whole score
+            // matrix, and that cost grows with context. Measured -37% at pp8192.
+            //
+            // The hyper-connection mix projections on their contraction axis: hc_fn is
+            // [4*n_embd, 24], and sharding AXIS_0 gives each device [4*n_embd/tps, 24]
+            // while the activation stays full width, so rocBLAS is handed k=4*n_embd
+            // against lda=4*n_embd/tps and rejects it with INVALID_VALUE. Prefill aborts
+            // outright. Splitting the contraction axis needs a matching split of the
+            // input, which is not modelled here.
+            //
+            // Both keep the design-A mirror below.
+            // everything else attention-side (indexer, hyper-connection, compressor,
+            // KV cache) keeps the design-A mirror below
+        }
+        if (replicate_attention) {
+            // split only the FFN/experts and the output projection, mirror all the rest
+            const bool is_ffn =
+                std::regex_match(tensor_name, pattern_ffn_up_weight)      || std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_bias)       || std::regex_match(tensor_name, pattern_ffn_gate_bias)   ||
+                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_weight)   || std::regex_match(tensor_name, pattern_ffn_down_bias)   ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
+            const bool is_output =
+                std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_output_bias);
+            if (!is_ffn && !is_output) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            // else fall through to the FFN / output patterns below
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -629,6 +727,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
+                if (head_split_attention) {
+                    // Design B splits the sinks per QUERY head so they line up with the Q
+                    // head split. The GQA granularity below is n_gqa, which under MQA
+                    // (n_head_kv == 1, as in deepseek MLA) is every head at once - it would
+                    // round every device down to zero and land all the sinks on one device.
+                    return {1};
+                }
                 return {std::lcm(n_embd_q, blck_size_perf)/n_embd_q * n_gqa};
             }
 

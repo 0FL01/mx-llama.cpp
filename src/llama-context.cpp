@@ -251,6 +251,8 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
 
+    // The fused indexer kernel is only instantiated for 32 or 64 heads. Design B keeps
+    // the indexer mirrored at its full head count, so the fused path always applies.
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
