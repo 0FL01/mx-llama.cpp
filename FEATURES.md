@@ -55,6 +55,40 @@ drops from 11% to 2.5%. Prefill is unchanged by design. On by default;
 `GGML_META_TOKEN_GRAPH=0` restores the per-subgraph dispatch. Requires the
 concurrent lane dispatch above. Validated on gfx906.
 
+## DeepSeek-V4-Flash tensor parallelism
+
+Upstream keeps the deepseek4 architecture on the tensor-split unsupported list,
+so `-sm tensor` refuses to load it. The fork implements the split: the MLA heads
+divide across the tensor-parallel group with the attention-side state mirrored
+per lane, the lightning-indexer selection runs on the GPU at any context length
+(above 16384 columns it previously fell back to the CPU, which corrupted output
+past 65k context), and the indexer top-k needs no cross-lane broadcast because
+the fused scores are AllReduce outputs and already bit-identical on every lane.
+Byte-deterministic over a 100k-token greedy run, perplexity consistent with
+`-sm layer` within 0.3%. Works with multi-stage `-tps`. Validated on gfx906.
+
+## DSpark drafter under tensor parallelism
+
+The DSpark drafter runs an in-graph argmax over the full vocabulary on logits it
+produces, which a vocabulary shard cannot serve, so upstream's
+`--spec-type draft-dspark` did not work under `-sm tensor`. The drafter is now
+replicated per lane instead of split (a small dense drafter loses more to
+per-layer AllReduce than it gains from splitting), the no-vocab sidecar borrows
+the target tokenizer, and the target's output projection is replicated so every
+device holds the full logit row. Measured on DeepSeek-V4-Flash at `-tps 4` over
+8 GPUs: generation 18.0 to 27.3 t/s. Validated on gfx906.
+
+## Allocation layout cache
+
+A change in the scheduler's backend assignment forced a drain-and-reserve before
+reallocating, and under `-sm layer` pipeline parallelism that drain hit on every
+assignment flip, serializing the pipe. The allocator now caches layouts per
+graph topology keyed by the buffer assignment and rebinds without draining when
+only the assignment changed, which is bit-exact (outputs byte-identical,
+perplexity unchanged). Worth +377% prefill at 100k context on DeepSeek-V4-Flash
+across 8 GPUs. On by default; `GGML_GALLOC_LAYOUT_CACHE=0` restores the old
+path. Backend-generic.
+
 ## Multi-GPU transfer tuning
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
