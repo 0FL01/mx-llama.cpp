@@ -183,7 +183,7 @@ static void launch_gated_delta_net(
     if constexpr (!keep_rs_t) {
         if (n_tokens >= 2 * CS && S_v <= 128) {
             launch_gated_delta_net_chunk<KDA, keep_rs_t>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3,
                 sv1, sv2, sv3, sb1, sb2, sb3,
                 neqk1, rq3, scale, K, stream);
@@ -191,8 +191,10 @@ static void launch_gated_delta_net(
         }
     } 
 
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int num_warps = cc == GGML_CUDA_CC_VEGA20 && n_tokens == 1 ? 2 : 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 

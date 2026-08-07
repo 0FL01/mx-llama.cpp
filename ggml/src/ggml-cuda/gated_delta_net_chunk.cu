@@ -77,6 +77,7 @@ gated_delta_net_chunked_cuda(
         const float * __restrict__ beta,
         const float * __restrict__ curr_state,
         float *       __restrict__ dst,
+        float *       __restrict__ state,
         int64_t       H,
         int64_t       n_tokens,
         int64_t       n_seqs,
@@ -101,8 +102,7 @@ gated_delta_net_chunked_cuda(
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
-    const int64_t attn_score_elems = (int64_t) S_v * H * n_tokens * n_seqs;
-    float *       state_out = dst + attn_score_elems;
+    float *       state_out = state;
 
     const int64_t state_in_offset  = sequence * K * H * S_v * S_v + h_idx * S_v * S_v;
     const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
@@ -243,16 +243,18 @@ template <bool KDA, bool /*keep_rs_t*/>
 void launch_gated_delta_net_chunk(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d,
+        float * dst_d, float * state_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int K, cudaStream_t stream) {
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int cc = ggml_cuda_info().devices[device].cc;
     const int CS = KDA ? 16 : 64;
-    const int num_warps = 4;
+    const int num_warps = cc == GGML_CUDA_CC_VEGA20 ? 2 : 4;
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
@@ -264,7 +266,7 @@ void launch_gated_delta_net_chunk(
             dim3 grid_dims(H, n_seqs, (S_v + num_warps * Tc - 1) / (num_warps * Tc));
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<16, KDA, KDA ? 16 : 64, Tc>, lp,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
             break;
@@ -274,7 +276,7 @@ void launch_gated_delta_net_chunk(
             dim3 grid_dims(H, n_seqs, (S_v + num_warps * Tc - 1) / (num_warps * Tc));
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<32, KDA, KDA ? 16 : 64, Tc>, lp,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
             break;
@@ -284,7 +286,7 @@ void launch_gated_delta_net_chunk(
             dim3 grid_dims(H, n_seqs, (S_v + num_warps * Tc - 1) / (num_warps * Tc));
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<64, KDA, KDA ? 16 : 64, Tc>, lp,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
             break;
@@ -294,7 +296,7 @@ void launch_gated_delta_net_chunk(
             dim3 grid_dims(H, n_seqs, (S_v + num_warps * Tc - 1) / (num_warps * Tc));
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
             ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<128, KDA, KDA ? 16 : 64, Tc>, lp,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
             break;
@@ -305,77 +307,25 @@ void launch_gated_delta_net_chunk(
     }
 }
 
-void ggml_cuda_op_gated_delta_net_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
-
-    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
-    GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
-    GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
-    GGML_TENSOR_LOCALS(size_t , nbk, src_k, nb);
-    GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
-    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
-    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
-
-    const int64_t S_v      = nev0;
-    const int64_t H        = nev1;
-    const int64_t n_tokens = nev2;
-    const int64_t n_seqs   = nev3;
-
-    const bool kda = (src_g->ne[0] == S_v);
-
-    GGML_ASSERT(neq1 == nek1);
-    const int64_t neqk1 = neq1;
-    const int64_t rq3 = nev3 / neq3;
-
-    const float * q_d = (const float *) src_q->data;
-    const float * k_d = (const float *) src_k->data;
-    const float * v_d = (const float *) src_v->data;
-    const float * g_d = (const float *) src_g->data;
-    const float * b_d = (const float *) src_beta->data;
-    const float * s_d = (const float *) src_state->data;
-    float *       dst_d = (float *) dst->data;
-
-    GGML_ASSERT(ggml_is_contiguous_rows(src_q));
-    GGML_ASSERT(ggml_is_contiguous_rows(src_k));
-    GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-    GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
-    GGML_ASSERT(src_g->ne[0] == 1 || kda);
-    GGML_ASSERT(ggml_is_contiguous(src_g));
-    GGML_ASSERT(ggml_is_contiguous(src_beta));
-    GGML_ASSERT(ggml_is_contiguous(src_state));
-
-    const int64_t sq1 = nbq1 / sizeof(float);
-    const int64_t sq2 = nbq2 / sizeof(float);
-    const int64_t sq3 = nbq3 / sizeof(float);
-    const int64_t sv1 = nbv1 / sizeof(float);
-    const int64_t sv2 = nbv2 / sizeof(float);
-    const int64_t sv3 = nbv3 / sizeof(float);
-    const int64_t sb1 = nbb1 / sizeof(float);
-    const int64_t sb2 = nbb2 / sizeof(float);
-    const int64_t sb3 = nbb3 / sizeof(float);
-
-    const float scale = 1.0f / sqrtf((float) S_v);
-
-    cudaStream_t stream = ctx.stream();
-
-    const int K = (int) src_state->ne[1];
-    const bool keep_rs = K > 1;
-
-    GGML_ASSERT(!keep_rs && "chunked kernel does not support K>1");
-
-    if (kda) {
-        launch_gated_delta_net_chunk<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
-    } else {
-        launch_gated_delta_net_chunk<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
-    }
-}
+// instantiated here, called from gated_delta_net.cu
+template void launch_gated_delta_net_chunk<true, false>(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d,
+        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, int K, cudaStream_t stream);
+template void launch_gated_delta_net_chunk<false, false>(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d,
+        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, int K, cudaStream_t stream);
 
