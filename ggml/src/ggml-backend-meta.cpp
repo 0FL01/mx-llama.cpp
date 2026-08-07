@@ -2132,6 +2132,10 @@ struct ggml_backend_meta_context {
         size_t              uid    = 0;
         int                 warm   = 0;      // tokens seen on this shape
         bool                failed = false;  // capture rejected: never retry
+        // Subgraphs [0, covered) are captured in `runs`. Anything at or past
+        // `covered` is dispatched per-subgraph after the replay. Only the
+        // GGML_META_TG_LIMIT debug knob makes this less than n_subgraphs.
+        size_t              covered = SIZE_MAX;
         std::vector<tg_run> runs;
     };
     std::vector<tg_entry> tg_cache;
@@ -3721,6 +3725,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // so the submission spread the AllReduce barrier bills is paid n_stages times
     // rather than at every one of the ~81 (dense) to ~172 (head-split MLA) closures.
     // Single-stage is one run, i.e. the whole token, unchanged.
+    // First subgraph the per-subgraph loop below must dispatch. The token-graph
+    // paths raise it past the captured prefix when a replay or a fresh capture
+    // already issued the leading subgraphs.
+    size_t i_dispatch_first = 0;
+
     if (backend_ctx->token_graph && cgraph->uid != 0 &&
         backend_ctx->tg_capture_begin != nullptr && backend_ctx->tg_capture_end != nullptr &&
         backend_ctx->comm_ar_prepare != nullptr && backend_ctx->comm_ar_launch_rank != nullptr &&
@@ -3755,7 +3764,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
                 }
-                return GGML_STATUS_SUCCESS;
+                if (tge->covered >= backend_ctx->n_subgraphs) {
+                    return GGML_STATUS_SUCCESS;
+                }
+                // Debug-limited capture: the tail past the captured prefix runs
+                // through the ordinary per-subgraph loop below.
+                i_dispatch_first = tge->covered;
+                goto per_subgraph_dispatch;
             }
         }
 
@@ -3766,11 +3781,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // An AllReduce that falls back to NCCL on the size gate still cannot be
         // captured, and that only shows up at prepare time below.
         if (!tge->failed && tge->warm > backend_ctx->tg_warm_needed) {
+            // Debug bisect knob: capture only the first GGML_META_TG_LIMIT
+            // subgraphs and dispatch the rest per-subgraph. Localizes which
+            // subgraph range replays incorrectly. Default: capture everything.
+            static const size_t tg_limit = []() {
+                const char * e = getenv("GGML_META_TG_LIMIT");
+                return e != nullptr ? (size_t) strtoull(e, nullptr, 10) : (size_t) SIZE_MAX;
+            }();
+            const size_t n_cap = std::min(backend_ctx->n_subgraphs, tg_limit);
             std::vector<ggml_backend_meta_context::tg_run> runs;
             {
                 ggml_backend_meta_context::tg_run cur;
                 bool open = false;
-                for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+                for (size_t i = 0; i < n_cap; i++) {
                     const auto & sg = backend_ctx->subgraphs[i];
                     if (!open) {
                         cur = {};
@@ -3823,7 +3846,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                __func__, (size_t) cgraph->uid);
             } else {
                 backend_ctx->tg_free_entry(*tge);
-                tge->runs = runs;
+                tge->runs    = runs;
+                tge->covered = n_cap;
 
                 bool ok = true;
                 std::vector<ggml_tensor *> nodes;
@@ -3883,10 +3907,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             }
                         }
                     }
-                    GGML_LOG_DEBUG("%s: uid %zu captured %zu runs x %zu lanes, %zu subgraphs\n",
+                    GGML_LOG_DEBUG("%s: uid %zu captured %zu runs x %zu lanes, %zu/%zu subgraphs\n",
                                    __func__, (size_t) cgraph->uid, tge->runs.size(),
-                                   backend_ctx->tps, backend_ctx->n_subgraphs);
-                    return GGML_STATUS_SUCCESS;
+                                   backend_ctx->tps, tge->covered, backend_ctx->n_subgraphs);
+                    if (tge->covered >= backend_ctx->n_subgraphs) {
+                        return GGML_STATUS_SUCCESS;
+                    }
+                    i_dispatch_first = tge->covered;
+                    goto per_subgraph_dispatch;
                 }
 
                 tge->failed = true;
@@ -3898,8 +3926,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     // ------------------------------------------------------------------------
 
+per_subgraph_dispatch:
     const bool run_debug = backend_ctx->dbg_run;
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+    for (size_t i = i_dispatch_first; i < backend_ctx->n_subgraphs; i++) {
         const auto & sg      = backend_ctx->subgraphs[i];
         const size_t stage   = sg.stage;
         const size_t lane_lo = stage * backend_ctx->tps;
