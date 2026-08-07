@@ -1842,7 +1842,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    bool allocated = !backend_ids_changed && ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+    if (!allocated) {
+        // The assignment changed or the active layout does not fit. Before
+        // paying the reserve (which drains every backend and serializes any
+        // cross-chunk pipeline overlap), try the allocation-layout cache with
+        // the current buffer-id assignment - a hit re-binds without a drain
+        // and is valid for any buffer count because only an exactly-matching
+        // assignment is adopted.
+        allocated = ggml_gallocr_alloc_graph_ids(sched->galloc, &sched->graph,
+                sched->node_backend_ids, sched->leaf_backend_ids);
+    }
+    if (!allocated) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
