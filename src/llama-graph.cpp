@@ -1335,8 +1335,6 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         ggml_set_output(t_h_nextn);
     }
     {
-        // LLAMA_TAP_NO_OUTPUT=1: PROBE - do not pin the tap tensors as outputs.
-        static const bool tap_no_output = getenv("LLAMA_TAP_NO_OUTPUT") != nullptr;
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (!embeddings_layer_inp[il]) {
@@ -1366,7 +1364,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
                 ggml_tensor * cpy = ggml_cpy(ctx_compute.get(), t, dst);
                 ggml_build_forward_expand(gf, cpy);
                 t_layer_inp[il] = cpy;
-            } else if (!tap_no_output) {
+            } else {
                 ggml_set_output(t_layer_inp[il]);
             }
         }

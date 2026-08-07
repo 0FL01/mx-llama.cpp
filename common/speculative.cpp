@@ -1052,24 +1052,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' input embeddings
-        //
-        // DIAGNOSTIC ONLY: LLAMA_SPEC_TAP_LIMIT=N enables just the first N taps. Enabling
-        // them triples the target's per-token prefill GPU cost (0.45 -> 1.58 ms/token
-        // measured on DeepSeek-V4 at 8 GPUs) and neither the hc_mean chain (~0.5 ms per
-        // ubatch) nor the readback (50 MB of MIRRORED bulk copies) accounts for it. If the
-        // cost scales with N it is per-tap work, if it does not it is the act of marking
-        // mid-graph tensors as outputs. Drafts are garbage with N < target_layer_ids_n -
-        // this is for timing the target only, never for a correctness or quality run.
-        uint32_t n_taps = target_layer_ids_n;
-        {
-            const char * s = getenv("LLAMA_SPEC_TAP_LIMIT");
-            if (s != nullptr) {
-                const uint32_t lim = (uint32_t) std::max(0, atoi(s));
-                n_taps = std::min(n_taps, lim);
-                LOG_WRN("%s: LLAMA_SPEC_TAP_LIMIT=%u - DIAGNOSTIC, drafts will be wrong\n",
-                        __func__, n_taps);
-            }
-        }
+        const uint32_t n_taps = target_layer_ids_n;
         for (uint32_t k = 0; k < n_taps; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
@@ -1407,18 +1390,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        // LLAMA_SPEC_CRASH_FENCE=1: name the faulting step inside draft()
-        static const bool crash_fence = getenv("LLAMA_SPEC_CRASH_FENCE") != nullptr;
-        auto fence = [&](const char * where) {
-            if (!crash_fence) {
-                return;
-            }
-            LOG_INF("dflash-fence: before sync at %s\n", where);
-            llama_synchronize(params.ctx_tgt);
-            llama_synchronize(ctx_dft);
-            LOG_INF("dflash-fence: passed %s\n", where);
-        };
-
         // the draft KV must hold the whole prompt before the noise block decodes
         if (!pending.empty() && !flush_pending()) {
             LOG_ERR("%s: deferred prompt encode replay failed - skipping drafts\n", __func__);
@@ -1427,7 +1398,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             return;
         }
-        fence("post flush_pending");
 
         common_batch_clear(batch);
 
@@ -1473,7 +1443,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
-        fence("post noise decode");
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {

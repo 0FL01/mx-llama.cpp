@@ -1806,20 +1806,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
-    static const bool ids_trace = []() {
-        const char * env = getenv("GGML_SCHED_IDS_TRACE");
-        return env && atoi(env) != 0;
-    }();
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
-            if (ids_trace) {
-                fprintf(stderr, "[ids] node %d (%s) backend %d -> %d\n", i,
-                        sched->graph.nodes[i] ? sched->graph.nodes[i]->name : "?",
-                        sched->prev_node_backend_ids[i], sched->node_backend_ids[i]);
-            }
             break;
         }
     }
@@ -1828,19 +1819,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
-                if (ids_trace) {
-                    fprintf(stderr, "[ids] leaf %d (%s) backend %d -> %d\n", i,
-                            sched->graph.leafs[i] ? sched->graph.leafs[i]->name : "?",
-                            sched->prev_leaf_backend_ids[i], sched->leaf_backend_ids[i]);
-                }
                 break;
             }
         }
     }
-    if (ids_trace && !backend_ids_changed) {
-        fprintf(stderr, "[ids] unchanged (n_nodes=%d n_leafs=%d)\n", sched->graph.n_nodes, sched->graph.n_leafs);
-    }
-
     // allocate graph
     bool allocated = !backend_ids_changed && ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
     if (!allocated) {

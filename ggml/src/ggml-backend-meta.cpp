@@ -1578,28 +1578,6 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
-    // GGML_META_GET_DEBUG=1: which read path a tensor takes, and what each lane holds.
-    // A tensor that only one pipeline stage computed still looks well-formed here.
-    static const bool get_debug_all = getenv("GGML_META_GET_DEBUG") != nullptr;
-    if (get_debug_all && size >= sizeof(float)) {
-        fprintf(stderr, "[meta-get] %-14s axis=%d n_seg=%zu nr0=%u ne/lane:",
-                tensor->name, (int) split_state.axis, split_state.n_segments, split_state.nr[0]);
-        for (size_t j = 0; j < n_bufs; j++) {
-            fprintf(stderr, " %lld", (long long) split_state.ne[j]);
-        }
-        std::vector<char> tmp(size);
-        for (size_t j = 0; j < n_bufs; j++) {
-            const ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-            if (sj == nullptr || ggml_nbytes(sj) < offset + size) { fprintf(stderr, " [%zu:-]", j); continue; }
-            ggml_backend_tensor_get(sj, tmp.data(), offset, size);
-            const float * p = (const float *) tmp.data();
-            size_t nnz = 0;
-            for (size_t k = 0; k < size/sizeof(float); k++) { if (p[k] != 0.0f) nnz++; }
-            fprintf(stderr, " [%zu:nnz=%zu]", j, nnz);
-        }
-        fprintf(stderr, "\n");
-    }
-
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
@@ -1685,43 +1663,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // GGML_META_GET_DEBUG=1: a MIRRORED read takes lane 0, which is only correct
-            // if every lane really holds the same data. Print each lane so a tensor that
-            // only one stage computed is visible instead of silently returning whatever
-            // lane 0 has.
-            static const bool get_debug = getenv("GGML_META_GET_DEBUG") != nullptr;
-            if (get_debug && size >= sizeof(float)) {
-                fprintf(stderr, "[meta-get] %-28s MIRRORED nbytes=%zu lanes:", tensor->name, size);
-                std::vector<char> tmp(size);
-                for (size_t j = 0; j < n_bufs; j++) {
-                    const ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                    if (sj == nullptr) { fprintf(stderr, " [%zu:null]", j); continue; }
-                    ggml_backend_tensor_get(sj, tmp.data(), offset, size);
-                    const float * p = (const float *) tmp.data();
-                    double s = 0.0; size_t nnz = 0;
-                    for (size_t k = 0; k < size/sizeof(float); k++) { s += p[k]; if (p[k] != 0.0f) nnz++; }
-                    fprintf(stderr, " [%zu:sum=%+.4f nnz=%zu]", j, s, nnz);
-                }
-                fprintf(stderr, "\n");
-            }
             // TODO other simple backend may be better
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
         } break;
         default: {
-            // GGML_META_GET_LENIENT=1: zero-fill reads of split axes the
-            // gather path does not implement instead of aborting. Debug aid
-            // for eval-callback style full-graph dumps only.
-            static const bool lenient = []() {
-                const char * env = getenv("GGML_META_GET_LENIENT");
-                return env && atoi(env) != 0;
-            }();
-            if (lenient) {
-                fprintf(stderr, "[meta-get] lenient zero-fill for %s (unhandled split axis)\n",
-                        tensor->name);
-                memset(data, 0, size);
-                return;
-            }
             GGML_ABORT("fatal error");
         }
     }
@@ -2112,20 +2058,14 @@ struct ggml_backend_meta_context {
     void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
     void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
     void (*tg_graph_free)(ggml_backend_t, void *)   = nullptr;
-    // One recorded graph set per cgraph shape. A server alternates shapes
-    // (prefill vs decode, slots joining and leaving), and a single-slot cache
-    // would reset its warmup on every switch and never capture at all.
-    // A run is a maximal span of consecutive subgraphs on ONE stage whose closures are
-    // all AllReduce. Runs are separated by the stage transfers, which stay on the host:
-    // a transfer is a genuine cross-device dependency, so the next stage cannot be
-    // enqueued until it has happened. Single-stage graphs collapse to exactly one run,
-    // which is the original whole-token behaviour.
+    // One recorded graph set per cgraph shape - a server alternates shapes,
+    // and a single-slot cache would reset its warmup on every switch. Only
+    // single-stage graphs whose closures are all AllReduce are captured, so
+    // a shape records exactly one run: the whole token.
     struct tg_run {
         size_t              stage     = 0;
         size_t              i_beg     = 0;   // first subgraph in the run
         size_t              i_end     = 0;   // one past the last
-        size_t              i_closure = 0;   // subgraph whose TRANSFER runs after this
-        bool                transfer  = false;
         std::vector<void *> exec;            // one graph per lane of this stage
     };
     struct tg_entry {
@@ -2606,18 +2546,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
 
-    // GGML_META_GET_DEBUG=1: name the axis every async read goes through. A MIRRORED
-    // read takes one lane and is a single bulk copy, a split read loops all lanes with
-    // strided 2D copies - which for the DFlash layer taps means thousands of small
-    // transfers per prefill ubatch instead of one.
-    {
-        static const bool get_debug = getenv("GGML_META_GET_DEBUG") != nullptr;
-        if (get_debug) {
-            fprintf(stderr, "[meta-get-async] %-28s axis=%s size=%zu\n", tensor->name,
-                    ggml_backend_meta_split_axis_name(split_state.axis), size);
-        }
-    }
-
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
@@ -2737,65 +2665,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // of one logical graph. Whole graphs always carry a uid, so this selects the
     // fragment-safe handling (persistent stage state, cross-fragment transfers).
     const bool fragment = cgraph->uid == 0;
-
-    // GGML_META_DUMP_LANES=<substr>: before running, dump per-lane sums of every
-    // simple tensor whose meta tensor name contains the substring and that this
-    // graph consumes as a source. Splits "the lane copy was never written" from
-    // "the consumer reads a different pointer than the setter wrote".
-    static const char * dump_lanes_name = getenv("GGML_META_DUMP_LANES");
-    // Optional consumer-op filter: the MLA and LID masks share one tensor name,
-    // so GGML_META_DUMP_LANES_OP=LIGHTNING_INDEXER selects the lid consumer.
-    static const char * dump_lanes_op = getenv("GGML_META_DUMP_LANES_OP");
-    if (dump_lanes_name != nullptr && dump_lanes_name[0] != '\0') {
-        std::unordered_set<const ggml_tensor *> dumped;
-        for (int i = 0; i < cgraph->n_nodes && dumped.size() < 12; i++) {
-            if (dump_lanes_op != nullptr && strstr(ggml_op_name(cgraph->nodes[i]->op), dump_lanes_op) == nullptr) {
-                continue;
-            }
-            for (int s = 0; s < GGML_MAX_SRC; s++) {
-                ggml_tensor * src = cgraph->nodes[i]->src[s];
-                if (src == nullptr || src->buffer == nullptr || !ggml_backend_buffer_is_meta(src->buffer)) {
-                    continue;
-                }
-                // "*" matches any source (useful with the op filter alone)
-                if (dump_lanes_name[0] != '*' && strstr(src->name, dump_lanes_name) == nullptr) {
-                    continue;
-                }
-                if (!dumped.insert(src).second) {
-                    continue;
-                }
-                for (size_t j = 0; j < n_backends; j++) {
-                    ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
-                }
-                for (size_t j = 0; j < n_backends; j++) {
-                    ggml_tensor * sj = ggml_backend_meta_buffer_simple_tensor(src, j);
-                    if (sj == nullptr || ggml_nbytes(sj) == 0) {
-                        fprintf(stderr, "[lane-dump] %s (op %s) lane %zu: (no data)\n",
-                                src->name, ggml_op_name(cgraph->nodes[i]->op), j);
-                        continue;
-                    }
-                    const size_t n_take = std::min<size_t>(ggml_nelements(sj), 4096);
-                    std::vector<char> host(n_take * ggml_type_size(sj->type));
-                    ggml_backend_tensor_get(sj, host.data(), 0, host.size());
-                    double sum = 0.0;
-                    size_t n_zero = 0, n_inf = 0;
-                    for (size_t k = 0; k < n_take; k++) {
-                        float v = 0.0f;
-                        if (sj->type == GGML_TYPE_F32) {
-                            v = ((const float *) host.data())[k];
-                        } else if (sj->type == GGML_TYPE_F16) {
-                            v = ggml_fp16_to_fp32(((const ggml_fp16_t *) host.data())[k]);
-                        }
-                        if (v == 0.0f) n_zero++;
-                        if (std::isinf(v)) { n_inf++; continue; }
-                        sum += v;
-                    }
-                    fprintf(stderr, "[lane-dump] %s (op %s) lane %zu data=%p: n=%zu sum=%.4g zeros=%zu infs=%zu\n",
-                            src->name, ggml_op_name(cgraph->nodes[i]->op), j, sj->data, n_take, sum, n_zero, n_inf);
-                }
-            }
-        }
-    }
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -3167,13 +3036,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     buffer_writers[root].push_back(ii);
                 }
-                // GGML_META_XFER_AUDIT=1 names every stage-crossing source the
-                // transfer scan skips, with the reason. A skipped dependency is a
-                // silent wrong answer on the consuming stage's lanes.
-                static const bool xfer_audit = []() {
-                    const char * env = getenv("GGML_META_XFER_AUDIT");
-                    return env != nullptr && atoi(env) != 0;
-                }();
                 for (size_t s = 0; s < n_subgraphs; s++) {
                     if (backend_ctx->subgraphs[s].closure != ggml_backend_meta_context::subgraph_closure::TRANSFER) {
                         continue;
@@ -3204,10 +3066,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                             const ggml_backend_meta_split_state wss =
                                                 ggml_backend_meta_get_split_state(wnode, /*assume_sync =*/ true);
                                             if (wss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                                                if (xfer_audit) {
-                                                    fprintf(stderr, "[xfer-audit] sg%zu SKIP persistent write %s (%s) axis=%d read by %s\n",
-                                                            s, wnode->name, ggml_op_desc(wnode), (int) wss.axis, node->name);
-                                                }
                                                 continue;
                                             }
                                             xfer.push_back(wnode);
@@ -3224,10 +3082,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             // reshuffling, which the model architecture should not do.
                             const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ true);
                             if (ss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                                if (xfer_audit) {
-                                    fprintf(stderr, "[xfer-audit] sg%zu SKIP node src %s (%s) axis=%d n_seg=%u read by %s (node %d)\n",
-                                            s, src->name, ggml_op_desc(src), (int) ss.axis, ss.n_segments, node->name, k);
-                                }
                                 continue;
                             }
                             xfer.push_back(src);
@@ -3605,47 +3459,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto stage_transfer = [&](size_t i_subgraph, size_t stage_a, size_t stage_b) -> ggml_status {
         const ggml_status st = transfer_tensors(backend_ctx->subgraphs[i_subgraph].xfer, stage_a, stage_b);
 
-        // GGML_META_XFER_VERIFY=1: after the transfer, sync everything and compare
-        // each boundary tensor's bytes between the first source lane and every
-        // destination lane. A mismatch right here is a transport/ordering defect,
-        // a match here with a wrong value at consumption is a slot-binding defect.
-        static const bool xfer_verify = []() {
-            const char * env = getenv("GGML_META_XFER_VERIFY");
-            return env != nullptr && atoi(env) != 0;
-        }();
-        if (xfer_verify && st == GGML_STATUS_SUCCESS) {
-            for (size_t j = 0; j < n_backends; j++) {
-                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
-            }
-            const size_t lane_lo_a = stage_a * backend_ctx->tps;
-            const size_t lane_lo_b = stage_b * backend_ctx->tps;
-            for (ggml_tensor * boundary : backend_ctx->subgraphs[i_subgraph].xfer) {
-                ggml_tensor * sa = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_a);
-                const size_t nbytes = sa != nullptr ? ggml_nbytes(sa) : 0;
-                if (nbytes == 0) {
-                    continue;
-                }
-                const size_t n_take = std::min<size_t>(nbytes, 65536);
-                std::vector<char> ha(n_take);
-                ggml_backend_tensor_get(sa, ha.data(), 0, n_take);
-                for (size_t k = 0; k < backend_ctx->tps; k++) {
-                    // source lanes first: pairwise copies are only meaningful if the
-                    // sources agree, and a source-side disagreement points upstream
-                    ggml_tensor * sk = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_a + k);
-                    std::vector<char> hs(n_take);
-                    ggml_backend_tensor_get(sk, hs.data(), 0, n_take);
-                    const bool src_same = memcmp(ha.data(), hs.data(), n_take) == 0;
-                    ggml_tensor * db = ggml_backend_meta_buffer_simple_tensor(boundary, lane_lo_b + k);
-                    std::vector<char> hb(n_take);
-                    ggml_backend_tensor_get(db, hb.data(), 0, n_take);
-                    const bool dst_same_pair = memcmp(hs.data(), hb.data(), n_take) == 0;
-                    const bool dst_same_l0   = memcmp(ha.data(), hb.data(), n_take) == 0;
-                    fprintf(stderr, "[xfer-verify] %s k=%zu src0-vs-srck:%s srck-vs-dstk:%s src0-vs-dstk:%s (%zu bytes)\n",
-                            boundary->name, k, src_same ? "MATCH" : "DIFF",
-                            dst_same_pair ? "MATCH" : "DIFF", dst_same_l0 ? "MATCH" : "DIFF", n_take);
-                }
-            }
-        }
         return st;
     };
 
@@ -3756,13 +3569,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->tg_graph_launch(
                             backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
                     }
-                    if (r.transfer) {
-                        const size_t stage_b = backend_ctx->subgraphs[r.i_closure + 1].stage;
-                        const ggml_status st = stage_transfer(r.i_closure, r.stage, stage_b);
-                        if (st != GGML_STATUS_SUCCESS) {
-                            return st;
-                        }
-                    }
                 }
                 if (tge->covered >= backend_ctx->n_subgraphs) {
                     return GGML_STATUS_SUCCESS;
@@ -3822,12 +3628,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         break;
                     }
                     if (sg.closure == ggml_backend_meta_context::subgraph_closure::TRANSFER) {
-                        if (i + 1 >= backend_ctx->n_subgraphs) { runs.clear(); open = false; break; }
-                        cur.i_end    = i;          // the transfer subgraph is not captured
-                        cur.i_closure = i;
-                        cur.transfer = true;
-                        runs.push_back(cur);
+                        // multi-stage shapes are not captured
+                        runs.clear();
                         open = false;
+                        break;
                     }
                 }
                 if (open) {
@@ -3835,12 +3639,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            // Multi-stage capture is DISABLED. Recording one graph per lane per stage
-            // works mechanically (82 -> 3.8 subgraphs/call) but produces wrong results on
-            // an MoE target, and even when it was correct it measured +0.8% on one model
-            // and -2.2% on another, because the stage transfer reintroduces the barrier
-            // skew the capture is meant to remove. Single-stage capture is unaffected and
-            // stays on.
+            // Multi-stage capture stays off: it produced wrong results on MoE
+            // targets and measured no win, the stage transfer reintroduces the
+            // barrier skew the capture removes.
             bool eligible = !runs.empty() && backend_ctx->n_stages == 1;
             for (const auto & r : runs) {
                 if (r.i_end <= r.i_beg) { eligible = false; break; }
@@ -3905,13 +3706,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         for (size_t k = 0; k < backend_ctx->tps; k++) {
                             backend_ctx->tg_graph_launch(
                                 backend_ctx->backend_configs[lane_lo + k].backend, r.exec[k]);
-                        }
-                        if (r.transfer) {
-                            const size_t stage_b = backend_ctx->subgraphs[r.i_closure + 1].stage;
-                            const ggml_status st = stage_transfer(r.i_closure, r.stage, stage_b);
-                            if (st != GGML_STATUS_SUCCESS) {
-                                return st;
-                            }
                         }
                     }
                     GGML_LOG_DEBUG("%s: uid %zu captured %zu runs x %zu lanes, %zu/%zu subgraphs\n",
