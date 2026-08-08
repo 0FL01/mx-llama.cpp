@@ -759,7 +759,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
-#define GGML_SCHED_MAX_COPIES 4
+#define GGML_SCHED_MAX_COPIES 16
 #endif
 
 struct ggml_backend_sched_split {
@@ -896,7 +896,24 @@ static int ggml_backend_sched_default_n_copies(ggml_backend_t * backends, int n_
         return 1;
     }
 
-    size_t n_copies = std::min<size_t>(4, GGML_SCHED_MAX_COPIES);
+    // The ring depth bounds how many ubatches can be in flight, and therefore
+    // how many pipeline stages can compute at once: a layer pipeline over N
+    // GPUs needs N slots to keep every stage busy, and the fixed default of 4
+    // left half of an 8-GPU pipeline idle. Every slot costs another copy of
+    // the graph inputs, so GGML_SCHED_N_COPIES overrides this either way.
+    static const size_t n_copies_env = []() {
+        const char * env = getenv("GGML_SCHED_N_COPIES");
+        return env != nullptr ? (size_t) std::max(1, atoi(env)) : (size_t) 0;
+    }();
+
+    size_t n_devices = 0;
+    for (int i = 0; i < n_backends; i++) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backends[i])) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            n_devices++;
+        }
+    }
+
+    size_t n_copies = n_copies_env != 0 ? n_copies_env : std::max<size_t>(4, n_devices);
     for (int i = 0; i < n_backends; i++) {
         if (ggml_backend_is_meta(backends[i])) {
             n_copies = std::max(n_copies, ggml_backend_meta_n_stages(backends[i]));
