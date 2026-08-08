@@ -89,6 +89,28 @@ perplexity unchanged). Worth +377% prefill at 100k context on DeepSeek-V4-Flash
 across 8 GPUs. On by default; `GGML_GALLOC_LAYOUT_CACHE=0` restores the old
 path. Backend-generic.
 
+## Pipeline scheduling
+
+Two scheduler fixes for multi-GPU pipelines, both host-side and bit-exact.
+
+The pinned host buffers that stage graph inputs were allocated at exactly the
+requested size. Attention masks grow by one ubatch of columns on every prefill
+step, so every step freed and reallocated a slot - and pinned allocation and
+free synchronize the device, draining every GPU once per ubatch, with the cost
+scaling as the masks widen. They now grow in powers of two.
+
+The ring of input copies bounds how many ubatches can be in flight, and so how
+many pipeline stages can compute at once, but its depth was a fixed 4 whatever
+the topology: an 8-GPU layer pipeline kept about half its stages busy. The depth
+now follows the GPU count. Each slot costs another copy of the graph inputs, so
+GGML_SCHED_N_COPIES overrides it either way; tensor-parallel runs keep the depth
+their stage count asks for, which is what they want.
+
+Measured on DeepSeek-V4-Flash MXFP4 over 8 MI50 at 100k context, greedy output
+byte-identical in every arm:
+  -sm tensor -tps 4  prefill 167.0 -> 282.8 t/s  (+69%, staging)
+  -sm layer          prefill 426.9 -> 585.4 t/s  (+37%, ring depth)
+
 ## Multi-GPU transfer tuning
 
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
