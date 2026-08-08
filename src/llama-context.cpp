@@ -444,6 +444,18 @@ llama_context::llama_context(
             pipeline_parallel = false;
         }
 
+        // A sidecar drafter - identified by borrowing the target's context - drafts
+        // one token at a time, so the ring buys it nothing while its idle
+        // compute-buffer copies cost real time on a layer-split draft. Its prompt
+        // encode does not lose anything either, since that replays deferred against
+        // the target's chunks. Measured with the DSpark sidecar on
+        // DeepSeek-V4-Flash over 8 MI50 at 16k: -sm layer generation 23.0 -> 25.5
+        // t/s with prefill flat, -sm tensor unchanged. Opt back in with
+        // LLAMA_DRAFT_PIPELINE for debugging.
+        if (cparams.ctx_other != nullptr && !getenv("LLAMA_DRAFT_PIPELINE")) {
+            pipeline_parallel = false;
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
