@@ -1027,6 +1027,17 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
     }
 
     if (slot->buffer == nullptr || slot->size < size) {
+        // Grow in geometric steps rather than to the exact size. Pinned host
+        // allocation and free synchronize the device, so a slot that grows by
+        // one ubatch worth of mask on every prefill step drains the pipeline
+        // once per step. Rounding up amortizes that to O(log n) reallocations
+        // over a prefill: 16k-context tps4 prefill 380 -> 445 t/s.
+        size_t alloc_size = 1024*1024;
+        while (alloc_size < size) {
+            alloc_size *= 2;
+        }
+        size = alloc_size;
+
         ggml_backend_buffer_free(slot->buffer);
 
         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
