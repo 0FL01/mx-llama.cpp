@@ -308,6 +308,19 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
+
+    // Tiny-ubatch multi-GPU pipelining lets the host free-run ahead of lagging
+    // devices and race the sched's split-input copies (observed on ROCm, where
+    // enqueued cross-device event waits do not order reliably). Turn on the
+    // sched's host-drain for such configs before any sched is created. Setting
+    // the variable manually overrides this either way.
+    if (cparams.n_ubatch < 64) {
+#ifdef _WIN32
+        _putenv_s("GGML_SCHED_SYNC_NONGRAPH", "1");
+#else
+        setenv("GGML_SCHED_SYNC_NONGRAPH", "1", 0);
+#endif
+    }
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
