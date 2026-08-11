@@ -5662,7 +5662,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
                 return false;
             }
-            if (!ggml_cuda_repack_tensor_supported(op->src[0])) {
+            // Views of repacked weights are re-packed on the fly by the dispatch, so
+            // accept a view whose base is supported too.
+            if (!ggml_cuda_repack_mul_mat_should_fire(op->src[0])) {
                 return false;
             }
             if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 ||

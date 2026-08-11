@@ -222,9 +222,6 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
 
         // a repacked weight can only be consumed as src0
         if (i != 0) return false;
-        // Views of repacked weights have no correct dispatch path
-        // (scale-plane offset depends on the FULL ne1, not the view's).
-        if (w->view_src != nullptr) return false;
         const bool ok_mm   = op->op == GGML_OP_MUL_MAT    && ggml_n_dims(w) == 2;
         const bool ok_mmid = op->op == GGML_OP_MUL_MAT_ID && ggml_n_dims(w) == 3 &&
                              op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I32;
