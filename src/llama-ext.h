@@ -123,9 +123,43 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Run any pending scheduler re-reserve now instead of inside the next decode.
+// Setters that change the graph topology (layer-input taps, samplers, loras)
+// only flag the reserve, and the next llama_decode then pays a full scheduler
+// rebuild plus worst-case graph reservation across all devices inside its
+// measured wall time. A no-op when nothing is pending.
+LLAMA_API void llama_sched_reserve(struct llama_context * ctx);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+// Enable (n_tokens_cap > 0) or disable (0) a pinned position-indexed accumulation
+// buffer for the layer-input taps, one region per tap layer enabled at call time.
+// Single-seq ubatches with sequential positions are also async-copied there at their
+// sequence-position offset, so the whole prompt's taps survive across decode calls
+// without a per-chunk synchronize. Lets the DFlash/DSpark hook defer its prompt
+// gather+encode to the first draft and keep the target's prefill pipeline overlap.
+// Returns the buffer base (or nullptr on failure/disable).
+LLAMA_API float * llama_set_embeddings_layer_inp_accum(struct llama_context * ctx, int32_t n_tokens_cap);
+// Returns the base of lid's accum region (or nullptr). Does NOT synchronize -
+// bound the read with llama_layer_inp_accum_wait or a full llama_synchronize.
+LLAMA_API const float * llama_get_embeddings_layer_inp_accum(struct llama_context * ctx, uint32_t lid);
+// Block until every accum row below position p_end is on the host, using the
+// per-ubatch readiness events. Unlike llama_synchronize this does not wait for
+// work enqueued afterwards. Returns false when no live event covers p_end - the
+// caller must then fall back to llama_synchronize.
+LLAMA_API bool llama_layer_inp_accum_wait(struct llama_context * ctx, llama_pos p_end);
+
+// Non-blocking form: true if the accum rows below p_end have already landed.
+// Lets a consumer replay finished work without giving up the host's queue lead.
+LLAMA_API bool llama_layer_inp_accum_ready(struct llama_context * ctx, llama_pos p_end);
+
+// Fork-local declaration of a ggml symbol rather than an edit to the public
+// ggml-backend.h. Defined in ggml-backend.cpp, dispatched through the device
+// interface. Backends without a query report true so a poller still advances.
+struct ggml_backend_event;
+GGML_API bool ggml_backend_event_query(struct ggml_backend_event * event);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

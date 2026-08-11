@@ -304,7 +304,10 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
-    llama_token sampled; // in speculative mode, this is the last accepted token
+    // in speculative mode, this is the last accepted token. LLAMA_TOKEN_NULL until
+    // the first token of the task is sampled - drafting must not start before then
+    // (a null anchor reaches the draft graph as get_rows index -1)
+    llama_token sampled = LLAMA_TOKEN_NULL;
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
     // corresponding to one token position (size = n_embd)
@@ -2888,6 +2891,7 @@ private:
         }
     }
 
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -2985,7 +2989,10 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max();
 
-                if (n_draft_max > 0) {
+                // with the deferred sampling of chunked prefill, a slot can reach
+                // pre_decode before its first token was sampled - no anchor to
+                // draft from yet, skip this iteration
+                if (n_draft_max > 0 && slot.sampled != LLAMA_TOKEN_NULL) {
                     GGML_ASSERT(slot.can_speculate());
 
                     if (!slot.spec_draft.empty()) {
@@ -3573,6 +3580,22 @@ private:
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         if (!is_user_start && !near_prompt_end) {
+                            do_checkpoint = false;
+                        }
+
+                        // LLAMA_NO_MIDPROMPT_CKPT=1: skip ALL mid-prompt checkpoints.
+                        // llama_state_seq_get_data_ext drains the whole scheduler
+                        // pipeline, so every mid-prompt checkpoint serializes the
+                        // prefill rounds (measured 0.7-2.1 s per checkpoint on 8-GPU
+                        // -sm tensor, the drain tagged via LLAMA_SYNC_TRACE). The
+                        // near-prompt-end checkpoint is preserved - it is the one
+                        // that enables decode-time rollback. Mid-prompt checkpoints
+                        // only speed up partial prompt-cache reuse across requests.
+                        static const bool no_mid_ckpt = []() {
+                            const char * env = getenv("LLAMA_NO_MIDPROMPT_CKPT");
+                            return env && atoi(env) != 0;
+                        }();
+                        if (no_mid_ckpt && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
