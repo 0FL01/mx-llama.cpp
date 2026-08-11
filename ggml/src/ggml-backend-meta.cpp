@@ -202,9 +202,57 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
 
+static ggml_backend_buffer_type_t * ggml_backend_meta_device_get_extra_bufts(ggml_backend_dev_t dev);
+
+bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
+
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_tensor * w = op->src[i];
+        if (w == nullptr || w->buffer == nullptr) continue;
+        ggml_backend_buffer_type_t w_buft = ggml_backend_buffer_get_type(w->buffer);
+        if (!ggml_backend_buft_is_meta(w_buft) || !ggml_backend_meta_buft_is_repack(w_buft)) continue;
+
+        if (std::getenv("GGML_REPACK_GATE_TRACE")) {
+            fprintf(stderr, "[gate] op=%s src%d=%s w_type=%s op_type=%s src1_type=%s data=%p view=%s ne1=%ld\n",
+                op->name, i, w->name, ggml_type_name(w->type), ggml_type_name(op->type),
+                op->src[1] ? ggml_type_name(op->src[1]->type) : "none", (void*)w->data,
+                w->view_src ? "y" : "n", (long)(ggml_n_dims(w) == 2 ? w->ne[1] : -1));
+        }
+        if (i != 0) { if (std::getenv("GGML_REPACK_GATE_TRACE")) fprintf(stderr, "[gate] deny i!=0\n"); return false; }
+        // Views of repacked weights have no correct dispatch path
+        // (scale-plane offset depends on the FULL ne1, not the view's).
+        if (w->view_src != nullptr) { if (std::getenv("GGML_REPACK_GATE_TRACE")) fprintf(stderr, "[gate] deny view\n"); return false; }
+        const bool ok_mm   = op->op == GGML_OP_MUL_MAT    && ggml_n_dims(w) == 2;
+        const bool ok_mmid = op->op == GGML_OP_MUL_MAT_ID && ggml_n_dims(w) == 3 &&
+                             op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I32;
+        if (!ok_mm && !ok_mmid) { if (std::getenv("GGML_REPACK_GATE_TRACE")) fprintf(stderr, "[gate] deny op kind\n"); return false; }
+
+        if (w->type != GGML_TYPE_Q8_0) { if (std::getenv("GGML_REPACK_GATE_TRACE")) fprintf(stderr, "[gate] deny type\n"); return false; }
+        if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) { if (std::getenv("GGML_REPACK_GATE_TRACE")) fprintf(stderr, "[gate] deny dtypes\n"); return false; }
+
+        if (w->data == nullptr) {
+            if (std::getenv("GGML_REPACK_GATE_TRACE")) fprintf(stderr, "[gate] ALLOW %s\n", op->name);
+            return true;
+        }
+
+        const int64_t blck = ggml_blck_size(w->type);
+        const ggml_backend_meta_split_state ss =
+            meta_dev_ctx->get_split_state(w, meta_dev_ctx->get_split_state_ud);
+        if (ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            const size_t n_bufs = meta_dev_ctx->simple_devs.size();
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                for (size_t j = 0; j < n_bufs; j++) {
+                    if (ss.ne[s*n_bufs + j] % blck != 0) return false;
+                }
+            }
+        } else if (w->ne[0] % blck != 0) {
+            return false;
+        }
+    }
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
@@ -227,6 +275,38 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     }
     return true;
 }
+
+static const char * ggml_backend_meta_reg_get_name(ggml_backend_reg_t) {
+    return "Meta";
+}
+
+static size_t ggml_backend_meta_reg_get_device_count(ggml_backend_reg_t) {
+    return 0;
+}
+
+static ggml_backend_dev_t ggml_backend_meta_reg_get_device(ggml_backend_reg_t, size_t) {
+    return nullptr;
+}
+
+static void * ggml_backend_meta_reg_get_proc_address(ggml_backend_reg_t, const char * name) {
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *) ggml_backend_meta_device_get_extra_bufts;
+    }
+    return nullptr;
+}
+
+static const ggml_backend_reg_i ggml_backend_meta_reg_iface = {
+    /* .get_name          = */ ggml_backend_meta_reg_get_name,
+    /* .get_device_count  = */ ggml_backend_meta_reg_get_device_count,
+    /* .get_device        = */ ggml_backend_meta_reg_get_device,
+    /* .get_proc_address  = */ ggml_backend_meta_reg_get_proc_address,
+};
+
+static ggml_backend_reg ggml_backend_meta_reg = {
+    /* .api_version = */ GGML_BACKEND_API_VERSION,
+    /* .iface       = */ ggml_backend_meta_reg_iface,
+    /* .context     = */ nullptr,
+};
 
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
@@ -290,7 +370,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
     struct ggml_backend_device meta_dev = {
         /*iface  =*/ ggml_backend_meta_device_iface,
-        /*reg    =*/ nullptr,
+        /*reg    =*/ &ggml_backend_meta_reg,
         /*ctx    =*/ ctxs.back().get(),
     };
 
@@ -304,22 +384,32 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
 struct ggml_backend_meta_buffer_type_context {
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    bool repack = false;
 
     std::string name;
 
-    ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
+    ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts, bool repack = false)
+        : simple_bufts(std::move(simple_bufts)), repack(repack) {
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
+        if (getenv("GGML_META_TRACE") != nullptr) {
+            fprintf(stderr, "[meta-trace] ctor bufts=%zu repack=%d name='%s'\n", this->simple_bufts.size(), (int) repack, name.c_str());
+            for (size_t i = 0; i < this->simple_bufts.size(); i++) {
+                fprintf(stderr, "   [meta-trace]     simple[%zu] dev='%s' buft='%s'\n",
+                    i, ggml_backend_dev_name(ggml_backend_buft_get_device(this->simple_bufts[i])),
+                    this->simple_bufts[i] ? ggml_backend_buft_name(this->simple_bufts[i]) : "??");
+            }
+        }
     }
 
     bool operator<(const ggml_backend_meta_buffer_type_context & other) const {
-        return simple_bufts < other.simple_bufts;
+        return std::tie(simple_bufts, repack) < std::tie(other.simple_bufts, other.repack);
     }
 };
 
@@ -397,6 +487,32 @@ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
     return buft != nullptr && buft->iface.get_name == ggml_backend_meta_buffer_type_iface.get_name;
 }
 
+bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_meta(buft) &&
+           ((const ggml_backend_meta_buffer_type_context *) buft->context)->repack;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_from_simple(
+        ggml_backend_dev_t dev, std::vector<ggml_backend_buffer_type_t> simple_bufts, bool repack) {
+    static std::mutex mutex;
+    static std::map<std::pair<std::vector<ggml_backend_buffer_type_t>, bool>,
+                    struct ggml_backend_buffer_type> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto key = std::make_pair(simple_bufts, repack);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return &it->second;
+    }
+    auto * buft_ctx = new ggml_backend_meta_buffer_type_context(std::move(simple_bufts), repack);
+    struct ggml_backend_buffer_type meta_buft = {
+        /*iface  =*/ ggml_backend_meta_buffer_type_iface,
+        /*device =*/ dev,
+        /*ctx    =*/ buft_ctx,
+    };
+    return &cache.emplace(std::move(key), meta_buft).first->second;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev) {
     static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> meta_bufts;
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
@@ -445,7 +561,64 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
     return host_buft;
 }
 
+static ggml_backend_buffer_type_t * ggml_backend_meta_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    const size_t n_bufs = meta_dev_ctx->simple_devs.size();
+
+    static std::mutex mutex;
+    static std::map<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto & result = cache[dev];
+    if (!result.empty()) {
+        return result.data();
+    }
+
+    // fetch each lane's NULL-terminated extra buft list once
+    std::vector<std::vector<ggml_backend_buffer_type_t>> per_lane(n_bufs);
+    size_t n_slots = SIZE_MAX;
+    for (size_t k = 0; k < n_bufs; k++) {
+        ggml_backend_dev_t simple_dev = meta_dev_ctx->simple_devs[k];
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(simple_dev);
+        auto fn = reg ? (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+        if (getenv("GGML_META_TRACE") != nullptr) {
+            fprintf(stderr, "[meta-trace] get_extra_bufts lane=%zu dev='%s' reg=%p fn=%p\n",
+                k, ggml_backend_dev_name(simple_dev), (void *) reg, (void *) fn);
+        }
+        if (fn != nullptr) {
+            for (ggml_backend_buffer_type_t * e = fn(simple_dev); e != nullptr && *e != nullptr; e++) {
+                per_lane[k].push_back(*e);
+            }
+        }
+        if (getenv("GGML_META_TRACE") != nullptr) {
+            fprintf(stderr, "[meta-trace] get_extra_bufts lane=%zu extra_count=%zu\n", k, per_lane[k].size());
+        }
+        n_slots = std::min(n_slots, per_lane[k].size());
+    }
+    if (getenv("GGML_META_TRACE") != nullptr) {
+        fprintf(stderr, "[meta-trace] get_extra_bufts n_slots=%zu\n", n_slots);
+    }
+
+    // slot-wise composition: repack on EVERY lane, or not offered at all
+    for (size_t s = 0; s < n_slots; s++) {
+        std::vector<ggml_backend_buffer_type_t> slot_bufts;
+        slot_bufts.reserve(n_bufs);
+        for (size_t k = 0; k < n_bufs; k++) {
+            slot_bufts.push_back(per_lane[k][s]);
+        }
+        result.push_back(ggml_backend_meta_buffer_type_from_simple(dev, std::move(slot_bufts), /*repack=*/true));
+    }
+
+    result.push_back(nullptr);
+    GGML_LOG_DEBUG("meta extra bufts: dev=%p n_bufs=%zu n_slots=%zu result[0]=%s\n",
+        (void *) dev, n_bufs, n_slots, result.size() > 1 ? ggml_backend_buft_name(result[0]) : "(none)");
+    return result.data();
+}
+
 //
+
 // meta backend buffer
 //
 
@@ -2227,6 +2400,11 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     if (size == 0) {
+        return;
+    }
+
+    if (ggml_backend_meta_buft_is_repack(ggml_backend_buffer_get_type(tensor->buffer))) {
+        ggml_backend_tensor_set(tensor, data, offset, size);
         return;
     }
 

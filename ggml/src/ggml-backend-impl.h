@@ -91,6 +91,7 @@ extern "C" {
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
+    GGML_API bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API size_t         ggml_backend_meta_n_stages      (ggml_backend_t meta_backend);
