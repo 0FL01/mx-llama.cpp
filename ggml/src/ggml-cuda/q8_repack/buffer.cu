@@ -4,7 +4,7 @@
 // ggml_cuda_repack_tensor_supported().
 #include "repack.cuh"
 #include "repack-common.cuh"
-
+#include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
 
 #include <cstring>

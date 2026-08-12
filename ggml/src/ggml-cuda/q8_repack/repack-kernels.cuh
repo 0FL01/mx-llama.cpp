@@ -1,5 +1,6 @@
-// Device kernels for the Q8_0 repacked-weight path (AMD GCN only). MMV and GEMM are
-// templated on HAS_IDS so dense and MoE host paths share identical device code.
+// Device kernels and helpers for the Q8_0 repacked-weight path (AMD GCN only). MMV
+// and GEMM are templated on HAS_IDS so dense and MoE host paths share identical device
+// code. All __global__ kernels and __device__ functions use
 // #if defined(GGML_USE_HIP) && defined(__gfx906__) bodies; elsewhere NO_DEVICE_CODE stubs.
 #pragma once
 
@@ -17,6 +18,7 @@ template <int BN>
 static __global__ void repack_tile_off(
         const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_off,
         repack_tile_meta * __restrict__ tile_meta, const int n_expert) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     if (threadIdx.x != 0 || blockIdx.x != 0) {
         return;
     }
@@ -32,15 +34,24 @@ static __global__ void repack_tile_off(
         acc += nt;
         tile_off[e + 1] = acc;
     }
+#else
+    GGML_UNUSED_VARS(expert_bounds, tile_off, tile_meta, n_expert);
+    NO_DEVICE_CODE;
+#endif
 }
 
 static __device__ __forceinline__ int mmvq_dp4a_u4(
         const uint4 w, const int x0, const int x1, const int x2, const int x3) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     int a = ggml_cuda_dp4a((int) w.x, x0, 0);
     int b = ggml_cuda_dp4a((int) w.z, x2, 0);
     a = ggml_cuda_dp4a((int) w.y, x1, a);
     b = ggml_cuda_dp4a((int) w.w, x3, b);
     return a + b;
+#else
+    GGML_UNUSED_VARS(w, x0, x1, x2, x3);
+    return 0;
+#endif
 }
 
 // Fused-FFN epilogue shared by the dense and MoE MMV paths: up result + x_bias,
@@ -48,6 +59,7 @@ static __device__ __forceinline__ int mmvq_dp4a_u4(
 static __device__ __forceinline__ float rp_mmv_fusion_epilogue(
         const float up, const float gate, const float * x_bias, const float * gate_bias,
         const uint32_t bias_idx, const ggml_glu_op glu_op, const bool use_gate) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     float result = up;
     if (x_bias != nullptr) {
         result += x_bias[bias_idx];
@@ -65,6 +77,10 @@ static __device__ __forceinline__ float rp_mmv_fusion_epilogue(
         }
     }
     return result;
+#else
+    GGML_UNUSED_VARS(gate, x_bias, gate_bias, bias_idx, glu_op, use_gate);
+    return up;
+#endif
 }
 
 template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64, bool HAS_FUSION = false>
@@ -722,9 +738,14 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     mmq_gemm_q8_0_repacked_impl<HAS_IDS, 64, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif
 }
 
 // Launch wrapper: 32-wide waves, tuned for small batches.
@@ -737,7 +758,12 @@ static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_q8_0_repacked_w32
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     mmq_gemm_q8_0_repacked_impl<HAS_IDS, 32, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif
 }
