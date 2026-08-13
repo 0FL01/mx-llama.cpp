@@ -19,6 +19,7 @@ static __host__ __device__ inline T repack_nsp(const T ne0) {
 }
 
 static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
     const int64_t nsp      = repack_nsp(ne0);
     switch (type) {
         case GGML_TYPE_Q8_0: return (size_t) ne1 * nsp * 34;

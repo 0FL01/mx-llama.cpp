@@ -44,6 +44,8 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane
 // [ne1 x nsp]; padding sub-blocks are left zeroed.
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    // a non-multiple ne0 would silently drop the row tail below, so fail loudly instead
+    GGML_ASSERT(ne0 % 32 == 0);
     const int64_t n_blocks = ne0 / 32;
     const int64_t nsp      = repack_nsp(ne0);
     const size_t  qs_len   = (size_t) ne1 * nsp * 32;
