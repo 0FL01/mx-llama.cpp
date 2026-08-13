@@ -1,7 +1,7 @@
-// Repack buffer type: on upload, supported Q8_0 weights are converted to the GCN
-// two-plane layout; everything else is copied through unchanged. Only enabled on
-// GCN; the Q8_0 path is gated by GGML_CUDA_REPACK_Q8_0 in
-// ggml_cuda_repack_tensor_supported().
+// Repack buffer type: on upload, supported Q8_0 weights are converted to the
+// gfx906 two-plane layout; everything else is copied through unchanged. Enabled
+// only on gfx906 (the arch the kernels compile for); the Q8_0 path is gated by
+// GGML_CUDA_REPACK_Q8_0 in ggml_cuda_repack_tensor_supported().
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "ggml-cuda.h"
@@ -150,7 +150,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_repack_buffer_type_int
     nullptr,
 };
 
-// Repacked buffer type: only enabled on GCN with GGML_CUDA_REPACK_Q8_0, else
+// Repacked buffer type: only enabled on gfx906 with GGML_CUDA_REPACK_Q8_0, else
 // returns nullptr so the caller falls back to the normal CUDA buffer type.
 // Gating discovery here makes "repack off" fully native: no repack buft is
 // offered to the loader, so no structural repack code (meta supports_op,
@@ -162,7 +162,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
     if (device >= ggml_backend_cuda_get_device_count()) {
         return nullptr;
     }
-    if (!GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[device].cc)) {
+    // Kernels only compile for gfx906 (__gfx906__ guard); a wider GCN gate would
+    // hand two-plane weights to archs whose repack kernels are NO_DEVICE_CODE.
+    if (ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_VEGA20) {
         return nullptr;
     }
     if (!ggml_cuda_repack_enabled()) {
