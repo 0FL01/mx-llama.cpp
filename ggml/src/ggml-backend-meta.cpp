@@ -2871,6 +2871,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 backend_ctx->tensor_stage.clear();
             }
 
+            // Persistent-buffer (KV cache) write and read indices, needed so the
+            // stage seam can avoid splitting a layer between its cache writes and
+            // the reads of those same rows. Without this the seam can land
+            // mid-attention and the whole cache layer has to be relayed.
+            std::unordered_map<const ggml_tensor *, int> persist_first_write;
+            std::unordered_map<const ggml_tensor *, int> persist_last_read;
+            if (backend_ctx->n_stages > 1) {
+                auto vroot = [](const ggml_tensor * t) -> const ggml_tensor * {
+                    while (t != nullptr && t->view_src != nullptr) t = t->view_src;
+                    return t;
+                };
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * nd = cgraph->nodes[i];
+                    if (nd->view_src != nullptr) {
+                        const ggml_tensor * rt = vroot(nd);
+                        if (rt != nullptr && rt->buffer != nullptr &&
+                                ggml_backend_buffer_get_usage(rt->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                            auto it = persist_first_write.find(rt);
+                            if (it == persist_first_write.end()) persist_first_write[rt] = i;
+                        }
+                    }
+                    for (int sx = 0; sx < GGML_MAX_SRC; sx++) {
+                        const ggml_tensor * s = nd->src[sx];
+                        if (s == nullptr) continue;
+                        const ggml_tensor * rt = vroot(s);
+                        if (rt == nullptr || rt->buffer == nullptr) continue;
+                        if (ggml_backend_buffer_get_usage(rt->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) continue;
+                        if (ggml_backend_buffer_get_usage(rt->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
+                        persist_last_read[rt] = i;
+                    }
+                }
+            }
+
             int i_start = 0;
             // Fragments inherit the active stage from the previous fragment.
             int current_stage = fragment ? backend_ctx->frag_last_stage : 0;
@@ -2888,7 +2921,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // owning stage (i.e., non-zero ne[] only inside one stage's lane range)
                 // determines the active stage going forward. MIRRORED/PARTIAL inherit.
                 const int n_stage = node_owning_stage(node);
-                const bool stage_transition = (backend_ctx->n_stages > 1 && n_stage >= 0 && n_stage != current_stage && i > i_start);
+                bool stage_transition = (backend_ctx->n_stages > 1 && n_stage >= 0 && n_stage != current_stage && i > i_start);
+                if (stage_transition) {
+                    // Would this seam split a persistent buffer - writes before it,
+                    // reads after it? If so the whole buffer would have to be
+                    // relayed. Rewind the seam to before its first write so the
+                    // writes land on the same stage as the reads.
+                    int snap_to = i;
+                    for (const auto & kv : persist_first_write) {
+                        const int w = kv.second;
+                        if (w < i_start || w >= i) continue;
+                        const auto it_r = persist_last_read.find(kv.first);
+                        if (it_r == persist_last_read.end() || it_r->second < i) continue;
+                        if (w < snap_to) snap_to = w;
+                    }
+                    if (snap_to > i_start && snap_to < i) {
+                        // re-run this node under the new stage on the next iteration
+                        i = snap_to - 1;
+                        stage_transition = false;
+                        for (size_t j = 0; j < n_backends; j++) {
+                            auto & bcj = backend_ctx->backend_configs[j];
+                            bcj.cgraphs[n_subgraphs].offset = i_start;
+                        }
+                        backend_ctx->subgraphs.push_back({ (size_t) current_stage,
+                                                           ggml_backend_meta_context::subgraph_closure::TRANSFER, {} });
+                        n_subgraphs++;
+                        i_start = snap_to;
+                        current_stage = n_stage;
+                        continue;
+                    }
+                }
                 if (stage_transition) {
                     // Close the previous subgraph at [i_start, i-1] with TRANSFER closure so
                     // the boundary tensor (this subgraph's last node) gets broadcast to the
