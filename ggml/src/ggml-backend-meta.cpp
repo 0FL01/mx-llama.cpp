@@ -230,16 +230,27 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         if (w->type != GGML_TYPE_Q8_0) return false;
         if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
 
+        // Buffer-independent repackability: enforced here during buft selection so the
+        // gate agrees with ggml_cuda_repack_mul_mat_should_fire at dispatch. The CUDA
+        // all_of delegation below cannot cover this case: selection always calls
+        // supports_op with a null-data dummy buffer, so the early return below would
+        // otherwise skip it.
+        const int64_t blck = ggml_blck_size(w->type);
+        if (w->ne[0] % blck != 0) return false;
+        if (!ggml_is_contiguous(w)) return false;
+
         if (w->data == nullptr) {
+            // Buffer not allocated yet (buft selection). Only the per-lane split
+            // alignment below is deferred: it needs the real split state, and
+            // calculate_split_state aborts loudly on a misaligned axis-0 split.
             return true;
         }
 
-        const int64_t blck = ggml_blck_size(w->type);
         const ggml_backend_meta_split_state ss =
             meta_dev_ctx->get_split_state(w, meta_dev_ctx->get_split_state_ud);
         if (ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
             // rows are split per-lane; each lane's row count must stay block-aligned
-            // (the CUDA gate checks ne0 alignment via the all_of delegation below)
+            // (calculate_split_state already asserts this for axis-0 weights)
             const size_t n_bufs = meta_dev_ctx->simple_devs.size();
             for (size_t s = 0; s < ss.n_segments; s++) {
                 for (size_t j = 0; j < n_bufs; j++) {
