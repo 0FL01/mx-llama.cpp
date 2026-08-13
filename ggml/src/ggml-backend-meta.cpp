@@ -221,10 +221,13 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     }
     const ggml_backend_meta_device_context * meta_dev_ctx      = (const ggml_backend_meta_device_context *) dev->context;
     const ggml_backend_meta_device_context * meta_buft_dev_ctx = (const ggml_backend_meta_device_context *) dev_buft->context;
-    if (meta_dev_ctx->simple_devs.size() != meta_buft_dev_ctx->simple_devs.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < meta_dev_ctx->simple_devs.size(); i++) {
+    // Exact match, or one device list a prefix of the other. The prefix case is a
+    // subset draft group borrowing the target's tensors: lane i of the narrower
+    // Meta device is device i of the wider one, so per-device storage stays
+    // index-aligned. Only tensors mirrored on lanes the narrow side owns are
+    // reachable, which the graph-build transfer path already enforces.
+    const size_t n = std::min(meta_dev_ctx->simple_devs.size(), meta_buft_dev_ctx->simple_devs.size());
+    for (size_t i = 0; i < n; i++) {
         if (meta_dev_ctx->simple_devs[i] != meta_buft_dev_ctx->simple_devs[i]) {
             return false;
         }
