@@ -2301,6 +2301,17 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_sendrecv_tensor");
             if (comm_sendrecv != nullptr) {
                 xfer_comm_ctx = comm_init(simple_backends.data(), n_devs);
+                // Size the staging ring from the pipeline depth: one buffer per
+                // stage plus one in flight. The backend default is the
+                // compile-time maximum, which makes a shallow pipeline pay a
+                // deep one's staging footprint.
+                if (xfer_comm_ctx != nullptr) {
+                    auto set_depth = (void (*)(void *, size_t))
+                        ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_set_staging_depth");
+                    if (set_depth != nullptr) {
+                        set_depth(xfer_comm_ctx, n_stages + 1);
+                    }
+                }
             }
         }
 
