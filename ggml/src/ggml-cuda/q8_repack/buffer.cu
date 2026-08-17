@@ -25,8 +25,7 @@ static const char * ggml_backend_cuda_repack_buffer_type_get_name(ggml_backend_b
 }
 
 bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft) {
-    bool is_repack = buft->iface.get_name == ggml_backend_cuda_repack_buffer_type_get_name ||
-           ggml_backend_meta_buft_is_repack(buft);
+    bool is_repack = buft->iface.get_name == ggml_backend_cuda_repack_buffer_type_get_name;
     return is_repack;
 }
 

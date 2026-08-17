@@ -3,8 +3,6 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 
-#include "ggml-backend-impl.h"
-
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -32,7 +30,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
 }
 
 bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
-    if (src0->buffer == nullptr || !ggml_backend_buft_is_cuda_repack(src0->buffer->buft)) {
+    if (src0->buffer == nullptr || !ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_get_type(src0->buffer))) {
         return false;
     }
     if (ggml_cuda_repack_tensor_supported(src0)) {

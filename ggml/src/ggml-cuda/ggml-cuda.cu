@@ -5651,8 +5651,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     // GCN repacked weights are stored in a non-canonical two-plane layout and can only be
     // consumed as src0 of MUL_MAT / MUL_MAT_ID by the repacked dispatch. Reject every other
     // use so the model loader never places a repacked weight where a canonical-layout op
-    // (e.g. GET_ROWS on a Q8_0 embedding) would misread it. Mirrors the repack gate in
-    // ggml_backend_meta_device_supports_op (which delegates down to this function).
+    // (e.g. GET_ROWS on a Q8_0 embedding) would misread it. Direct (non-meta) repack bufts
+    // only: a meta-wrapped repack buft is handled authoritatively by the gate in
+    // ggml_backend_meta_device_supports_op before delegation, and dispatch sees the lane's
+    // direct buft.
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_buft_is_cuda_repack(op->src[i]->buffer->buft)) {

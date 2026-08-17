@@ -208,7 +208,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static ggml_backend_buffer_type_t * ggml_backend_meta_device_get_extra_bufts(ggml_backend_dev_t dev);
 
-bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
+static bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
@@ -485,7 +485,7 @@ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
     return buft != nullptr && buft->iface.get_name == ggml_backend_meta_buffer_type_iface.get_name;
 }
 
-bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft) {
+static bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft) {
     return ggml_backend_buft_is_meta(buft) &&
            ((const ggml_backend_meta_buffer_type_context *) buft->context)->repack;
 }

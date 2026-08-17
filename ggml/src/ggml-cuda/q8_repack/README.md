@@ -121,7 +121,8 @@ Template signature: `<ROWS, NWAVES, HAS_IDS, LANES, HAS_FUSION>`.
 External deps (parent `ggml-cuda/`): `common.cuh` (dp4a, warp_reduce_sum),
 `mmq.cuh` (`block_q8_1_mmq`, `QK8_1_MMQ`), `quantize.cuh`
 (`quantize_{row,mmq}_q8_1_cuda`), `mmid.cuh` (MoE helper), `unary.cuh` (GLU
-ops), `ggml-backend-impl.h` (`ggml_backend_meta_buft_is_repack`).
+ops), `ggml-backend-impl.h` (buffer struct / backend interface access in
+`buffer.cu`).
 
 ## Persistent view cache
 
@@ -162,7 +163,8 @@ Integration points in `ggml-cuda.cu` (the only TU outside the folder that sees
 
 The TP wrapper (`ggml-backend-meta.cpp`) plies the repack buft through the same
 channels: `get_extra_bufts` composes per-lane repack bufts into a meta repack
-buft (tagged via `ggml_backend_meta_buft_is_repack`), the meta `supports_op`
+buft (tagged by a `repack` flag in the meta buft context; the predicate stays
+static inside the meta TU, so no ggml API is extended), the meta `supports_op`
 mirrors the CUDA gate, and `set_tensor_async` bypasses chunk-splicing upload so
 repacked data reaches `set_tensor` intact. The loader assigns weights by
 iterating the buft list in order, and `make_gpu_buft_list` places extra bufts
