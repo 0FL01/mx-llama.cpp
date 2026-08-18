@@ -258,33 +258,62 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
         // streaming segments to the device scratch (207 s: tens of thousands of
         // tiny pageable H2D driver round-trips). The segments must stay host-
         // side and cheap; the tensor uploads once.
+        // Completed tensors go to the DEVICE repack path - one big async H2D of
+        // canonical bytes from pinned staging plus the repack kernel, the same
+        // machinery that put -sm layer loads at vanilla parity. Two pinned
+        // slots per device, event-guarded, so the next tensor's segments never
+        // overwrite an upload still in flight. (Streaming individual segments
+        // there instead measured 207 s - the granularity matters, not the path.)
         static std::mutex staging_mutex;
         struct dev_staging {
-            std::unique_ptr<uint8_t[]> buf;
-            size_t cap = 0;
-            const void * key = nullptr;
-            size_t filled = 0;
+            uint8_t *    buf     = nullptr;   // pinned
+            size_t       cap     = 0;
+            const void * key     = nullptr;
+            size_t       filled  = 0;
+            cudaEvent_t  ev      = nullptr;
+            bool         ev_live = false;
         };
-        static dev_staging s_stage[GGML_CUDA_MAX_DEVICES];
+        static dev_staging s_stage[GGML_CUDA_MAX_DEVICES][2];
+        static int         s_stage_turn[GGML_CUDA_MAX_DEVICES] = {};
 
         std::lock_guard<std::mutex> lock(staging_mutex);
-        dev_staging & d = s_stage[ctx->device];
+        const int dev = ctx->device;
+        dev_staging & d = s_stage[dev][s_stage_turn[dev]];
+        if (d.key != tensor->data && d.key != nullptr) {
+            GGML_ASSERT(d.filled == 0 && "repack staging: previous tensor incomplete");
+        }
+        if (d.ev_live) {
+            // slot's previous upload must land before its bytes are overwritten
+            CUDA_CHECK(cudaEventSynchronize(d.ev));
+            d.ev_live = false;
+        }
         if (d.cap < t_nbytes) {
-            d.buf.reset(new uint8_t[t_nbytes]);   // default-init, no zero fill
+            if (d.buf != nullptr) {
+                CUDA_CHECK(cudaFreeHost(d.buf));
+            }
+            CUDA_CHECK(cudaMallocHost((void **) &d.buf, t_nbytes));
             d.cap = t_nbytes;
         }
         if (d.key != tensor->data) {
-            // the loader finishes one tensor per device before the next
-            GGML_ASSERT(d.filled == 0 && "repack staging: previous tensor incomplete");
-            d.key = tensor->data;
+            d.key    = tensor->data;
+            d.filled = 0;
         }
         GGML_ASSERT(offset + size <= t_nbytes);
-        memcpy(d.buf.get() + offset, data, size);
+        memcpy(d.buf + offset, data, size);
         d.filled += size;
         if (d.filled == t_nbytes) {
             d.key    = nullptr;
             d.filled = 0;
-            repack_and_upload(buffer, tensor, d.buf.get());
+            if (s_upl_stream[dev] == nullptr) {
+                CUDA_CHECK(cudaStreamCreateWithFlags(&s_upl_stream[dev], cudaStreamNonBlocking));
+            }
+            ggml_cuda_repack_set_tensor_async(dev, s_upl_stream[dev], tensor, d.buf, 0, t_nbytes);
+            if (d.ev == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(d.ev, s_upl_stream[dev]));
+            d.ev_live = true;
+            s_stage_turn[dev] ^= 1;
         }
         return;
     }
