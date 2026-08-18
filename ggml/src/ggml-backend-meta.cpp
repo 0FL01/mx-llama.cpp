@@ -2358,14 +2358,67 @@ struct ggml_backend_meta_context {
     }
 
     // Sync-fallback scratch for set_tensor_async on layouts the chunk-by-chunk path can't handle:
-    // multi-segment splits, and PARTIAL axis (per-device 1/N scaling needs the whole tensor).
-    // Sequentially-arriving chunks accumulate here, then dispatch via the sync set_tensor path
-    // once the last byte is in.
+    // multi-segment splits, PARTIAL axis, and repacked buffers. Sequentially-arriving chunks
+    // accumulate here (persistent buffers, never zero-filled), and a completed tensor is handed
+    // to ONE worker thread that runs the sync set_tensor splice - so the caller can read the
+    // next tensor from disk while the previous one splices, packs and uploads. Two slots give
+    // a depth-2 pipeline; the worker is joined in free() and drained in synchronize().
     struct fallback_accum {
-        const ggml_tensor *  tensor = nullptr;
-        std::vector<uint8_t> data;
+        const ggml_tensor *        tensor = nullptr;
+        std::unique_ptr<uint8_t[]> buf;
+        size_t                     cap    = 0;
+        size_t                     filled = 0;
     };
-    fallback_accum accum;
+    fallback_accum          accum[2];
+    int                     accum_turn = 0;
+    std::thread             accum_worker;
+    std::mutex              accum_mutex;
+    std::condition_variable accum_cv;
+    fallback_accum *        accum_job  = nullptr;   // pending job, depth 1
+    bool                    accum_stop = false;
+
+    void accum_worker_loop() {
+        std::unique_lock<std::mutex> lock(accum_mutex);
+        for (;;) {
+            accum_cv.wait(lock, [&] { return accum_job != nullptr || accum_stop; });
+            if (accum_job == nullptr) {
+                return;
+            }
+            fallback_accum * job = accum_job;
+            lock.unlock();
+            ggml_backend_tensor_set(const_cast<ggml_tensor *>(job->tensor), job->buf.get(), 0, ggml_nbytes(job->tensor));
+            lock.lock();
+            job->tensor = nullptr;
+            job->filled = 0;
+            accum_job   = nullptr;
+            accum_cv.notify_all();
+        }
+    }
+    // hand a completed slot to the worker; blocks while the previous job is still running
+    void accum_submit(fallback_accum * slot) {
+        std::unique_lock<std::mutex> lock(accum_mutex);
+        if (!accum_worker.joinable()) {
+            accum_worker = std::thread([this] { accum_worker_loop(); });
+        }
+        accum_cv.wait(lock, [&] { return accum_job == nullptr; });
+        accum_job = slot;
+        accum_cv.notify_all();
+    }
+    void accum_drain() {
+        std::unique_lock<std::mutex> lock(accum_mutex);
+        accum_cv.wait(lock, [&] { return accum_job == nullptr; });
+    }
+    void accum_shutdown() {
+        {
+            std::unique_lock<std::mutex> lock(accum_mutex);
+            accum_cv.wait(lock, [&] { return accum_job == nullptr; });
+            accum_stop = true;
+            accum_cv.notify_all();
+        }
+        if (accum_worker.joinable()) {
+            accum_worker.join();
+        }
+    }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const bool copy_only = params != nullptr && strcmp(params, "copy-only") == 0;
@@ -2580,6 +2633,7 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    backend_ctx->accum_shutdown();
     delete backend_ctx;
     delete backend;
 }
@@ -2593,7 +2647,37 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 
     if (ggml_backend_meta_buft_is_repack(ggml_backend_buffer_get_type(tensor->buffer))) {
-        ggml_backend_tensor_set(tensor, data, offset, size);
+        // Forwarding raw chunks to the sync path asserts in the splitter
+        // (partial writes cannot be spliced). Accumulate and dispatch whole
+        // tensors through the worker instead.
+        ggml_backend_meta_context * be_ctx = (ggml_backend_meta_context *) backend->context;
+        const size_t total = ggml_nbytes(tensor);
+        if (offset == 0 && size == total) {
+            be_ctx->accum_drain();   // keep tensor order for the lane buffers
+            ggml_backend_tensor_set(tensor, data, 0, size);
+            return;
+        }
+        auto & acc = be_ctx->accum[be_ctx->accum_turn];
+        if (acc.tensor != tensor) {
+            GGML_ASSERT(acc.tensor == nullptr && "meta accum: slot busy on tensor switch");
+            if (acc.cap < total) {
+                acc.buf.reset(new uint8_t[total]);   // default-init, no zero fill
+                acc.cap = total;
+            }
+            acc.tensor = tensor;
+            acc.filled = 0;
+        }
+        GGML_ASSERT(offset + size <= total);
+        memcpy(acc.buf.get() + offset, data, size);
+        acc.filled += size;
+        if (acc.filled == total) {
+            be_ctx->accum_submit(&acc);
+            be_ctx->accum_turn ^= 1;
+            // make sure the next slot is free before the caller reuses it
+            if (be_ctx->accum[be_ctx->accum_turn].tensor != nullptr) {
+                be_ctx->accum_drain();
+            }
+        }
         return;
     }
 
@@ -2609,17 +2693,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             return;
         }
         ggml_backend_meta_context * be_ctx = (ggml_backend_meta_context *) backend->context;
-        auto & acc = be_ctx->accum;
+        auto & acc = be_ctx->accum[be_ctx->accum_turn];
         if (acc.tensor != tensor) {
+            GGML_ASSERT(acc.tensor == nullptr && "meta accum: slot busy on tensor switch");
+            if (acc.cap < total) {
+                acc.buf.reset(new uint8_t[total]);   // default-init, no zero fill
+                acc.cap = total;
+            }
             acc.tensor = tensor;
-            acc.data.assign(total, 0);
+            acc.filled = 0;
         }
-        GGML_ASSERT(offset + size <= acc.data.size());
-        memcpy(acc.data.data() + offset, data, size);
-        if (offset + size == acc.data.size()) {
-            ggml_backend_tensor_set(tensor, acc.data.data(), 0, acc.data.size());
-            acc.tensor = nullptr;
-            std::vector<uint8_t>().swap(acc.data);
+        GGML_ASSERT(offset + size <= total);
+        memcpy(acc.buf.get() + offset, data, size);
+        acc.filled += size;
+        if (acc.filled == total) {
+            be_ctx->accum_submit(&acc);
+            be_ctx->accum_turn ^= 1;
+            if (be_ctx->accum[be_ctx->accum_turn].tensor != nullptr) {
+                be_ctx->accum_drain();
+            }
         }
         return;
     }
@@ -2783,6 +2875,7 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 }
 
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+    ((ggml_backend_meta_context *) backend->context)->accum_drain();
     ggml_backend_meta_context * sync_ctx = (ggml_backend_meta_context *) backend->context;
     if (sync_ctx->dbg_chunk) {
         const double t0 = ggml_time_us()/1000.0;

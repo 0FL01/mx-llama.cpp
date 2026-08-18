@@ -1458,7 +1458,9 @@ bool llama_model_loader::load_all_data(
         if (buft != ggml_backend_dev_buffer_type(dev)) {
             // A device-local extra buffer type (e.g. repacked weights) still takes
             // the async path: its backend's set_tensor_async owns any layout
-            // conversion. Only a buffer type from another device is rejected.
+            // conversion (the meta backend accumulates chunks and forwards whole
+            // tensors through a worker). Only another device's buffer type is
+            // rejected.
             if (ggml_backend_buft_get_device(buft) != dev) {
                 LLAMA_LOG_DEBUG("%s: buffer type %s is not local to device %s for async uploads\n", func,
                     ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));

@@ -30,6 +30,18 @@ bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft) {
     return is_repack;
 }
 
+// Pinned upload slots: two per device, alternating, event-guarded.
+struct upl_slot {
+    uint8_t *   p       = nullptr;
+    size_t      cap     = 0;
+    cudaEvent_t ev      = nullptr;
+    bool        ev_live = false;
+};
+static upl_slot     s_upl[GGML_CUDA_MAX_DEVICES][2];
+static int          s_upl_turn[GGML_CUDA_MAX_DEVICES] = {};
+static cudaStream_t s_upl_stream[GGML_CUDA_MAX_DEVICES] = {};
+static std::mutex   s_upl_mutex;
+
 // Repack one tensor into the GCN layout (per-expert stride repack_gcn_nbytes) and
 // upload it; the source may be the host upload buffer or an accumulated staging copy.
 static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
@@ -44,15 +56,46 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
 
     const size_t src_stride = ggml_nbytes(tensor) / ne2;
     const size_t dst_stride = repack_gcn_nbytes(tensor->type, ne0, ne1);
-    std::vector<uint8_t> repacked(dst_stride * ne2);
+    const size_t need       = dst_stride * ne2;
+
+    // Pinned double-buffered upload scratch per device: repack into one slot,
+    // launch the H2D asynchronously on a dedicated stream, and only wait when
+    // the slot comes around again. Hides the upload behind the next tensor's
+    // read and splice; a pageable synchronous H2D here measured ~22 s of the
+    // -sm tensor MoE load. Completion before compute is enforced by
+    // ggml_cuda_repack_async_release() at the first graph compute.
+    std::lock_guard<std::mutex> upl_lock(s_upl_mutex);
+    const int dev = ctx->device;
+    if (s_upl_stream[dev] == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s_upl_stream[dev], cudaStreamNonBlocking));
+    }
+    upl_slot & u = s_upl[dev][s_upl_turn[dev]];
+    s_upl_turn[dev] ^= 1;
+    if (u.ev_live) {
+        CUDA_CHECK(cudaEventSynchronize(u.ev));
+        u.ev_live = false;
+    }
+    if (u.cap < need) {
+        if (u.p != nullptr) {
+            CUDA_CHECK(cudaFreeHost(u.p));
+        }
+        CUDA_CHECK(cudaMallocHost((void **) &u.p, need));
+        u.cap = need;
+    }
+    if (u.ev == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&u.ev, cudaEventDisableTiming));
+    }
+    uint8_t * repacked = u.p;
+
     for (int64_t e = 0; e < ne2; e++) {
         repack_q8_0_host((const block_q8_0 *) (src + e * src_stride),
-            repacked.data() + e * dst_stride, ne0, ne1);
+            repacked + e * dst_stride, ne0, ne1);
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(tensor->data, repacked.data(), repacked.size(),
-        cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaMemcpyAsync(tensor->data, repacked, need,
+        cudaMemcpyHostToDevice, s_upl_stream[dev]));
+    CUDA_CHECK(cudaEventRecord(u.ev, s_upl_stream[dev]));
+    u.ev_live = true;
 }
 
 // ---- async upload path ------------------------------------------------------
@@ -161,6 +204,18 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
 }
 
 void ggml_cuda_repack_async_release(int device) {
+    // Drain any in-flight pinned uploads from the sync/meta path first - this
+    // runs at the first graph compute, so nothing may still be uploading.
+    {
+        std::lock_guard<std::mutex> lock(s_upl_mutex);
+        for (int k = 0; k < 2; k++) {
+            upl_slot & u = s_upl[device][k];
+            if (u.ev_live) {
+                CUDA_CHECK(cudaEventSynchronize(u.ev));
+                u.ev_live = false;
+            }
+        }
+    }
     if (s_async[device].scratch == nullptr) {
         return;
     }
@@ -195,29 +250,42 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
     const size_t t_nbytes = ggml_nbytes(tensor);
 
     if (offset != 0 || size != t_nbytes) {
-        // Partial write: accumulate into a host staging buffer and repack once complete.
+        // Partial write (the meta splitter under -sm tensor): accumulate into a
+        // persistent per-device host staging buffer - grown on demand, never
+        // zero-filled, never freed between tensors - then repack once complete.
+        // Two measured wrong shapes for this path: a fresh zero-filled vector
+        // per lane tensor (~74 s of a 96 s MoE load: ~35 GB of value-init), and
+        // streaming segments to the device scratch (207 s: tens of thousands of
+        // tiny pageable H2D driver round-trips). The segments must stay host-
+        // side and cheap; the tensor uploads once.
         static std::mutex staging_mutex;
+        struct dev_staging {
+            std::unique_ptr<uint8_t[]> buf;
+            size_t cap = 0;
+            const void * key = nullptr;
+            size_t filled = 0;
+        };
+        static dev_staging s_stage[GGML_CUDA_MAX_DEVICES];
 
-        struct staging_entry { std::vector<uint8_t> data; size_t filled = 0; };
-        static std::map<void*, staging_entry> staging;
-        void * key = tensor->data;
-        staging_entry full;
-        {
-            std::lock_guard<std::mutex> lock(staging_mutex);
-            auto & staged = staging[key];
-            if (staged.data.empty()) {
-                staged.data.resize(t_nbytes, 0);
-            }
-            GGML_ASSERT(offset + size <= t_nbytes);
-            memcpy(staged.data.data() + offset, data, size);
-            staged.filled += size;
-            if (staged.filled < t_nbytes) {
-                return;
-            }
-            full = std::move(staged);
-            staging.erase(key);
+        std::lock_guard<std::mutex> lock(staging_mutex);
+        dev_staging & d = s_stage[ctx->device];
+        if (d.cap < t_nbytes) {
+            d.buf.reset(new uint8_t[t_nbytes]);   // default-init, no zero fill
+            d.cap = t_nbytes;
         }
-        repack_and_upload(buffer, tensor, full.data.data());
+        if (d.key != tensor->data) {
+            // the loader finishes one tensor per device before the next
+            GGML_ASSERT(d.filled == 0 && "repack staging: previous tensor incomplete");
+            d.key = tensor->data;
+        }
+        GGML_ASSERT(offset + size <= t_nbytes);
+        memcpy(d.buf.get() + offset, data, size);
+        d.filled += size;
+        if (d.filled == t_nbytes) {
+            d.key    = nullptr;
+            d.filled = 0;
+            repack_and_upload(buffer, tensor, d.buf.get());
+        }
         return;
     }
 
