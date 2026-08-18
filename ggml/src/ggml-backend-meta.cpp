@@ -377,9 +377,26 @@ ggml_backend_dev_t ggml_backend_meta_device(
     }
     ctxs.push_back(std::make_unique<ggml_backend_meta_device_context>(ctx));
 
+    // Only publish a registry when at least one lane actually offers extra buffer
+    // types. Otherwise leave it null, exactly as before, so no caller of
+    // ggml_backend_dev_backend_reg() sees a behaviour change.
+    bool any_extra_bufts = false;
+    for (ggml_backend_dev_t simple_dev : simple_devs) {
+        ggml_backend_reg_t r = ggml_backend_dev_backend_reg(simple_dev);
+        auto fn = r ? (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(r, "ggml_backend_dev_get_extra_bufts") : nullptr;
+        if (fn != nullptr) {
+            ggml_backend_buffer_type_t * e = fn(simple_dev);
+            if (e != nullptr && *e != nullptr) {
+                any_extra_bufts = true;
+                break;
+            }
+        }
+    }
+
     struct ggml_backend_device meta_dev = {
         /*iface  =*/ ggml_backend_meta_device_iface,
-        /*reg    =*/ &ggml_backend_meta_reg,
+        /*reg    =*/ any_extra_bufts ? &ggml_backend_meta_reg : nullptr,
         /*ctx    =*/ ctxs.back().get(),
     };
 
