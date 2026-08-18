@@ -3030,6 +3030,13 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
+    if (ggml_backend_buft_is_cuda_repack(buf->buft)) {
+        // Chunked canonical bytes stage into device scratch; the repack kernel
+        // fires on the same stream once the tensor is complete.
+        ggml_cuda_repack_set_tensor_async(cuda_ctx->device, cuda_ctx->stream(), tensor, data, offset, size);
+        return;
+    }
+
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -5030,6 +5037,12 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static thread_local bool g_cuda_outer_capture = false;
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    {
+        // The repack upload scratch lives only between model load and the first
+        // compute; once released this is a single pointer test.
+        ggml_backend_cuda_context * ctx0 = (ggml_backend_cuda_context *) backend->context;
+        ggml_cuda_repack_async_release(ctx0->device);
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
