@@ -41,13 +41,17 @@ d plane   [ne1 * nsp *  2 bytes]  f16 scale per 32-value sub-block
 
 ## Compute paths
 
-Two kernel families, chosen per 2D slice:
+Three kernel families, chosen per 2D slice:
 
 | Path | Kernel | Trigger |
 |---|---|---|
 | Mat-vec (single token) | `mul_mat_vec_q8_0_repacked<ROWS,NWAVES,HAS_IDS,LANES>` | `ne11 == 1` (dense) / `n_tokens == 1` (MoE) |
+| Mat-vec (narrow batch) | `mul_mat_vec_q8_0_repacked_nc<ROWS,NWAVES,NCOLS,RPL>` | `2 <= ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS`, dense only |
 | GEMM 64-wide | `mmq_gemm_q8_0_repacked<HAS_IDS,TN_,NRL>` | `ne11 >= 128` (dense) / `n_tokens >= MMQ_RP_Q8_MOE_W32_MAX_TOKENS` (MoE) |
-| GEMM 32-wide | `mmq_gemm_q8_0_repacked_w32<HAS_IDS,TN_,NRL>` | `ne11 < 128` (dense) / `n_tokens < MMQ_RP_Q8_MOE_W32_MAX_TOKENS` (MoE) |
+| GEMM 32-wide | `mmq_gemm_q8_0_repacked_w32<HAS_IDS,TN_,NRL>` | `MMQ_RP_Q8_MMV_MAX_TOKENS < ne11 < 128` (dense) / `n_tokens < MMQ_RP_Q8_MOE_W32_MAX_TOKENS` (MoE) |
+
+The narrow mat-vec is dense-only. MoE keeps the tile from two tokens up: its
+token counts are per expert, so a narrow ubatch does not imply a narrow tile.
 
 Both GEMM wrappers forward to one device function
 `mmq_gemm_q8_0_repacked_impl<HAS_IDS, CW, TN_, NRL>`.
@@ -74,7 +78,10 @@ load paths: **full** (unchecked, only when the whole tile is in-bounds) and
 **checked** (bounds-tested per element). The epilogue vectorizes with `float4`
 when the output row stride is 4-aligned; MoE scatters via `ids_dst`.
 
-**Multi-token input format.** src1 is quantized with the grouped MMQ layout
+**Multi-token input format.** This applies to the tiled GEMM only; the narrow
+mat-vec takes plain `block_q8_1` rows, the same layout as the single-token
+path, with a row stride of `ne10_padded / QK8_1` blocks.
+src1 is quantized with the grouped MMQ layout
 (`quantize_mmq_q8_1_cuda`). The buffer is reinterpreted as `block_q8_1_mmq_h`,
 which exposes the same 64 bytes as `float d4[4]` instead of the stock `half2`
 union, so activation scales read directly as f32 (no extra fp16->fp32 pass).

@@ -1311,6 +1311,7 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list_plain;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -1559,6 +1560,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+
+        // NextN/MTP head blocks keep canonical weights: they only ever run at
+        // draft width, where the repacked path is slower, and they are a
+        // couple of layers so the prefill layout buys nothing there.
+        buft_list_t plain = make_gpu_buft_list(dev.dev, split_mode, tensor_split, /*use_extra_bufts =*/ false);
+        plain.insert(plain.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+        pimpl->gpu_buft_list_plain.emplace(dev.dev, std::move(plain));
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1610,6 +1618,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+        if (il >= (int) hparams.n_layer()) {
+            return {dev, &pimpl->gpu_buft_list_plain.at(dev)};
+        }
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 

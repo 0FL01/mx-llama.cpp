@@ -10,6 +10,10 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
         cudaStream_t stream);
+static void ggml_cuda_mul_mat_repacked_nc(const ggml_tensor * src0,
+        const uint8_t * w, const block_q8_1 * xq, float * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne11,
+        const uint32_t xs, const uint32_t ys, cudaStream_t stream);
 
 void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -40,10 +44,11 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t x_stride    = ne10_padded / QK8_1;
 
-    if (ne11 == 1) {
-        // Single token: plain Q8_1, mat-vec per slice.
+    if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
+        // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
+        // tiled path below computes a full 32-wide tile whatever the batch is.
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
-            ne13 * ne12 * x_stride);
+            ne13 * ne12 * ne11 * x_stride);
         {
             const int64_t s11 = src1->nb[1] / sizeof(float);
             const int64_t s12 = src1->nb[2] / sizeof(float);
@@ -51,13 +56,19 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
                 src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
+        const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
             const block_q8_1 * xq = src1_q8_1.get()
-                              + (i3 * ne12 + i2) * x_stride;
+                              + (i3 * ne12 + i2) * ne11 * x_stride;
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
-            ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
-                ne00, ne01, ne11, stream);
+            if (ne11 == 1) {
+                ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
+                    ne00, ne01, ne11, stream);
+            } else {
+                ggml_cuda_mul_mat_repacked_nc(src0, w, xq, dst_d,
+                    ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+            }
         }
         }
         return;
@@ -84,6 +95,58 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
             ne00, ne01, ne11, stream);
     }
+    }
+}
+
+// Narrow batch (2..8 tokens): one multi-column mat-vec pass per slice.
+static void ggml_cuda_mul_mat_repacked_nc(const ggml_tensor * src0,
+        const uint8_t * w, const block_q8_1 * xq, float * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne11,
+        const uint32_t xs, const uint32_t ys, cudaStream_t stream) {
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+    // Geometry per width, measured on Qwen3.8-27B (pp512 at that ubatch, 4x
+    // MI50 -sm tensor). The row count per lane is small once the tensor is
+    // split, so scheduling granularity beats per-group reuse and 64-thread
+    // workgroups spread over the CUs win. Two rows per lane reuse the
+    // activation block across rows and pay from 3 tokens up; at 2 there is
+    // too little to amortize, and 4 rows spills.
+    switch (ne11) {
+        case 2: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 2, 2, 1><<<grid, 128, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        case 3: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 1, 3, 2><<<grid, 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        case 4: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 1, 4, 2><<<grid, 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        case 5: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 1, 5, 2><<<grid, 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        case 6: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 1, 6, 2><<<grid, 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        case 7: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 1, 7, 2><<<grid, 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        case 8: {
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_q8_0_repacked_nc<2, 1, 8, 2><<<grid, 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
+        } break;
+        default: GGML_ABORT("nc mat-vec: unsupported batch width");
     }
 }
 

@@ -11,6 +11,11 @@
 #define MMQ_RP_Q8_BM 64
 #define MMQ_RP_Q8_NROW_LANES 4
 #define MMQ_RP_Q8_MOE_W32_MAX_TOKENS 1024
+// Widths at or below this take one multi-column mat-vec pass instead of the
+// tiled GEMM. Measured on Qwen3.8-27B pp512, 4x MI50 -sm tensor: the mat-vec
+// leads from 2 tokens (77.2 against the tile's 14.3) through 8 (159.6 against
+// 98.9), and the tile takes back over by 12, so the crossover is 8 to 12.
+#define MMQ_RP_Q8_MMV_MAX_TOKENS 8
 
 template <typename T>
 static __host__ __device__ inline T repack_nsp(const T ne0) {

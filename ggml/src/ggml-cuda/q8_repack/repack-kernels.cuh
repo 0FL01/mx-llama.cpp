@@ -749,6 +749,102 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
 }
 
 // Launch wrapper: 32-wide waves, tuned for small batches.
+// Narrow-batch mat-vec: NCOLS tokens per weight pass. A 2-8 token batch (a
+// speculative verify step, a tiny ubatch) is too narrow for the tiled GEMM,
+// which computes a full 32-wide tile whatever the batch is - measured 274 us
+// against 140 us for the canonical mul_mat_vec_q at 4 tokens. Reading the
+// weights once and keeping one accumulator per token amortizes the weight
+// traffic the same way, on the repacked layout. Dense only: the single-token
+// path and the MoE ids path keep their existing kernels.
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1>
+static __global__ void mul_mat_vec_q8_0_repacked_nc(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t xs, const uint32_t ys) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    constexpr int LANES = 64;
+    static_assert(ROWS == NWAVES * RPL, "row geometry");
+    const int warp_id = threadIdx.x / LANES;
+    const int lane    = threadIdx.x % LANES;
+    const int row     = blockIdx.x * ROWS + warp_id * RPL;
+
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp      = repack_nsp(ne0);
+
+    // RPL rows per lane: the activation block is loaded once into registers and
+    // reused against every row the lane owns, so the activation side stops
+    // being re-read per row. This is what the canonical mat-vec does with its
+    // register blocking, and at NCOLS=4 the activations are otherwise 4x the
+    // weight bytes per step.
+    const uint4    * w_rows[RPL];
+    const uint16_t * d_rows[RPL];
+    uint16_t         rmasks[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        const int      rr   = row + r;
+        const uint32_t wrow = min((uint32_t) rr, ne1 - 1);
+        w_rows[r] = reinterpret_cast<const uint4 *>(wbase) + (size_t) wrow * nsp * 2;
+        d_rows[r] = reinterpret_cast<const uint16_t *>(
+            wbase + (size_t) ne1 * nsp * 32) + (size_t) wrow * nsp;
+        rmasks[r] = (rr < (int) ne1) ? (uint16_t) 0xffffu : (uint16_t) 0x0000u;
+    }
+
+    float acc[RPL][NCOLS] = {};
+
+    // Whole 32-quant blocks per lane step: one weight-scale read and one
+    // activation block per column per 32 quants. The half-block stride paid
+    // both twice, and at sharded row counts the loop is a handful of
+    // iterations, so per-step overhead is most of the kernel.
+    for (uint32_t sb = (uint32_t) lane; sb < n_blocks; sb += (uint32_t) LANES) {
+        // Weights for the lane's rows stay in registers; the activation block is
+        // re-read per row from L1, which is cheaper than the register pressure
+        // of holding NCOLS x 8 ints alongside the accumulators.
+        uint4 wv0[RPL], wv1[RPL];
+        float dw[RPL];
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            wv0[r] = w_rows[r][sb * 2u];
+            wv1[r] = w_rows[r][sb * 2u + 1u];
+            const uint16_t db = d_rows[r][sb] & rmasks[r];
+            dw[r] = __half2float(*reinterpret_cast<const __half *>(&db));
+        }
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const block_q8_1 * xb = xq + (size_t) c * xs + sb;
+            const float dx = __low2float(xb->ds);
+            const int * x = reinterpret_cast<const int *>(xb->qs);
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                int idot = 0;
+                idot = ggml_cuda_dp4a((int) wv0[r].x, x[0], idot);
+                idot = ggml_cuda_dp4a((int) wv0[r].y, x[1], idot);
+                idot = ggml_cuda_dp4a((int) wv0[r].z, x[2], idot);
+                idot = ggml_cuda_dp4a((int) wv0[r].w, x[3], idot);
+                idot = ggml_cuda_dp4a((int) wv1[r].x, x[4], idot);
+                idot = ggml_cuda_dp4a((int) wv1[r].y, x[5], idot);
+                idot = ggml_cuda_dp4a((int) wv1[r].z, x[6], idot);
+                idot = ggml_cuda_dp4a((int) wv1[r].w, x[7], idot);
+                acc[r][c] += dw[r] * dx * (float) idot;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const float a = rp_warp_reduce_sum<LANES>(acc[r][c]);
+            if (lane == 0 && (row + r) < (int) ne1) {
+                y[(size_t) c * ys + row + r] = a;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys);
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <bool HAS_IDS, int TN_, int NRL>
 static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_q8_0_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
