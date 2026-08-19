@@ -7,14 +7,6 @@
 #include <map>
 #include <mutex>
 
-bool ggml_cuda_repack_enabled() {
-    static const bool q8 = [] {
-        const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
-        return e != nullptr && e[0] != '0';
-    }();
-    return q8;
-}
-
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // Views are never in repacked layout (the scale-plane offset needs the FULL ne1).
     if (t->view_src != nullptr) return false;
@@ -23,7 +15,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }
     switch (t->type) {
         case GGML_TYPE_Q8_0: {
-            return ggml_cuda_repack_enabled() && t->ne[0] % 32 == 0;
+            return t->ne[0] % 32 == 0;
         }
         default:             return false;
     }

@@ -140,7 +140,6 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group(
     return out;
 }
 
-bool ggml_cuda_repack_enabled();
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 
 const uint8_t * repack_q8_0_view_get_cached(

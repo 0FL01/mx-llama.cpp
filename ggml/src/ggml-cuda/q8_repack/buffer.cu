@@ -384,10 +384,6 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
     if (ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_VEGA20) {
         return nullptr;
     }
-    if (!ggml_cuda_repack_enabled()) {
-        return nullptr;
-    }
-
     static ggml_backend_buffer_type buft_storage[GGML_CUDA_MAX_DEVICES];
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
 

@@ -113,7 +113,7 @@ Template signature: `<ROWS, NWAVES, HAS_IDS, LANES, HAS_FUSION>`.
 | `repack.cuh` | Public API (7 functions: buft predicate, buffer-type factory, tensor support, should-fire, dense/MoE/mat-vec-fused dispatch). The only header included outside the folder. | `ggml-cuda.cu` |
 | `repack-common.cuh` | Tuning knobs (`MMQ_RP_Q8_*`), layout math (`repack_nsp`, `repack_gcn_nbytes`), X swizzle (`sX_swizzle<CW>`), device structs (`rp_x_sub`, `block_q8_1_mmq_h`, `sXq_row_q8`), input-gather helpers, DPP warp reduce, host helper declarations. | all TUs in folder |
 | `repack-kernels.cuh` | All device kernels: `repack_tile_off`, `mul_mat_vec_q8_0_repacked` (optional `HAS_FUSION` epilogue), `mmq_gemm_q8_0_repacked_impl` + 64/32-wide launch wrappers, `repack_tile_meta`. GCN-guarded, `NO_DEVICE_CODE` elsewhere. | `mul-mat.cu`, `mul-mat-id.cu` |
-| `repack-common.cu` | `ggml_cuda_repack_enabled()` (env gate), `ggml_cuda_repack_tensor_supported()`, `ggml_cuda_repack_mul_mat_should_fire()` (also handles views), host repack `repack_q8_0_host()`, persistent per-view cache `repack_q8_0_view_get_cached`. | `mul-mat.cu`, `mul-mat-id.cu`, `buffer.cu`, `ggml-cuda.cu` |
+| `repack-common.cu` | `ggml_cuda_repack_tensor_supported()`, `ggml_cuda_repack_mul_mat_should_fire()` (also handles views), host repack `repack_q8_0_host()`, persistent per-view cache `repack_q8_0_view_get_cached`. | `mul-mat.cu`, `mul-mat-id.cu`, `buffer.cu`, `ggml-cuda.cu` |
 | `mul-mat.cu` | Dense entry `ggml_cuda_mul_mat_repacked()` + per-slice dispatcher, dense fused host `ggml_cuda_mul_mat_vec_repacked_fused()`. | `ggml-cuda.cu` |
 | `mul-mat-id.cu` | MoE entry `ggml_cuda_mul_mat_id_repacked()` (token routing, tile prefix-sum, GEMM dispatch). | `ggml-cuda.cu` |
 | `buffer.cu` | Repack buffer type: `set_tensor` (repacks supported Q8_0, handles full and staged partial writes), `get_alloc_size`, factory `ggml_backend_cuda_repack_buffer_type()`, `ggml_backend_buft_is_cuda_repack()`. `get_tensor` is nullptr. | backend registration |
@@ -142,9 +142,9 @@ from the matching offset in the base scale plane; hits just return the pointer.
   renaming files requires a reconfigure.
 - Enabled only on gfx906 (the arch the kernels compile for); elsewhere the
   buffer-type factory returns nullptr and the plain CUDA buffer type is used.
-  Runtime gating is via the `GGML_CUDA_REPACK_Q8_0` env var (checked in
-  `ggml_cuda_repack_enabled()`); when off, no repack buffer type is offered, so
-  no repack structural code is active.
+  Runtime control follows the CPU weight repack: extra buffer types carry the
+  repack buft, so `--no-repack` (`use_extra_bufts = false`) disables it and no
+  repack structural code is active.
 
 Integration points in `ggml-cuda.cu` (the only TU outside the folder that sees
 `repack.cuh`):
