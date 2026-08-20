@@ -311,6 +311,20 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
     repack_and_upload(buffer, tensor, (const uint8_t *) data);
 }
 
+// The CUDA buffer's own free_buffer, captured once so the repack wrapper can
+// purge its view-cache entries and then delegate.
+static void (*s_cuda_free_buffer)(ggml_backend_buffer_t) = nullptr;
+
+static void ggml_backend_cuda_repack_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_repack_buffer_type_context * ctx =
+        (ggml_backend_cuda_repack_buffer_type_context *) buffer->buft->context;
+    repack_view_cache_purge(ctx->device, ggml_backend_buffer_get_base(buffer),
+        ggml_backend_buffer_get_size(buffer));
+    if (s_cuda_free_buffer != nullptr) {
+        s_cuda_free_buffer(buffer);
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_repack_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_repack_buffer_type_context * ctx =
@@ -324,6 +338,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_repack_buffer_type_alloc_buffer(
 
     buffer->buft              = buft;
     buffer->iface.set_tensor  = ggml_backend_cuda_repack_buffer_set_tensor;
+    s_cuda_free_buffer        = buffer->iface.free_buffer;
+    buffer->iface.free_buffer = ggml_backend_cuda_repack_buffer_free_buffer;
     // Weights are write-once; the inherited CUDA get_tensor would misread the
     // two-plane layout as canonical, so it must be explicitly nulled
     // (ggml_backend_tensor_get has no null guard).

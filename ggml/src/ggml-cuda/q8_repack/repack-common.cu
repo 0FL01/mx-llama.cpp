@@ -118,3 +118,22 @@ const uint8_t * repack_q8_0_view_get_cached(
     s_view_cache[key] = { d_ptr, total };
     return d_ptr;
 }
+
+void repack_view_cache_purge(int device, const void * base, size_t size) {
+    if (base == nullptr || size == 0) {
+        return;
+    }
+    const uint8_t * lo = (const uint8_t *) base;
+    const uint8_t * hi = lo + size;
+    ggml_cuda_set_device(device);
+    std::lock_guard<std::mutex> lock(s_view_cache_mutex);
+    for (auto it = s_view_cache.begin(); it != s_view_cache.end(); ) {
+        const uint8_t * v = (const uint8_t *) it->first.view_data;
+        if (v >= lo && v < hi) {
+            CUDA_CHECK(cudaFree(it->second.d_ptr));
+            it = s_view_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}

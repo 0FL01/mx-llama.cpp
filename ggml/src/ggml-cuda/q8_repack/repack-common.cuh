@@ -162,3 +162,8 @@ void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne
 
 const uint8_t * repack_q8_0_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base, cudaStream_t stream);
+
+// Drop cached re-packed views that live inside [base, base+size) - called when the
+// owning buffer is freed so the allocator cannot hand the same addresses to a
+// different model and hit a stale entry.
+void repack_view_cache_purge(int device, const void * base, size_t size);
