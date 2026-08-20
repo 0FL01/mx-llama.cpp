@@ -757,7 +757,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
 // traffic the same way, on the repacked layout. Dense only: the single-token
 // path and the MoE ids path keep their existing kernels.
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1>
-static __global__ void mul_mat_vec_q8_0_repacked_nc(
+static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
@@ -841,6 +841,60 @@ static __global__ void mul_mat_vec_q8_0_repacked_nc(
     }
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1>
+static __global__ void mul_mat_vec_q8_0_repacked_nc(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t xs, const uint32_t ys) {
+    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL>(
+        wbase, xq, y, ne0, ne1, xs, ys);
+}
+
+// MoE narrow batch: one assignment per block, one launch for all of them.
+// Expert token counts are per expert, so at verify widths nearly every active
+// expert holds a single assignment and the 32-wide tile computes 32 columns to
+// serve it. tile_meta built with BN=1 gives each block its expert and its
+// assignment index; ids_src1/ids_dst give the source and destination rows.
+// Which expert owns assignment a. expert_bounds is the monotonic per-expert
+// start offset, so this is an upper_bound minus one - cheap enough per block
+// that building a metadata array up front is not worth a kernel launch.
+static __device__ __forceinline__ uint32_t expert_bounds_search(
+        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert,
+        const uint32_t a) {
+    uint32_t lo = 0, hi = n_expert;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if ((uint32_t) expert_bounds[mid + 1] <= a) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+template <int ROWS, int NWAVES, int RPL = 1>
+static __global__ void mul_mat_vec_q8_0_repacked_id1(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert,
+        const size_t expert_stride, const uint32_t xs, const uint32_t ys) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    const uint32_t a = blockIdx.y;
+    const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
+    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, 1, RPL>(
+        wbase + (size_t) e * expert_stride,
+        xq + (size_t) ids_src1[a] * xs,
+        y  + (size_t) ids_dst[a]  * ys,
+        ne0, ne1, xs, ys);
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds,
+                     n_expert, expert_stride, xs, ys);
     NO_DEVICE_CODE;
 #endif
 }

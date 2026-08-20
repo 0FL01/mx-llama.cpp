@@ -59,6 +59,26 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 
     const int64_t s11 = src1->nb[1] / sizeof(float);
 
+    // Narrow batch: one mat-vec per assignment in a single launch, instead of a
+    // 32-wide tile per active expert.
+    if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS &&
+        src0->type == GGML_TYPE_Q8_0) {
+        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
+            (size_t) n_cols * x_stride);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
+            src0->type, ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded,
+            n_cols, 1, 1, stream);
+
+        // Four rows per block, two waves. Five geometries were measured at
+        // the verify widths and all landed within five percent; this was best.
+        const dim3 grid((ne01 + 3) / 4, (unsigned) n_assign, 1);
+        mul_mat_vec_q8_0_repacked_id1<4, 2, 2><<<grid, 128, 0, stream>>>(
+            w, src1_q8_1.get(), dst_d, (uint32_t) ne00, (uint32_t) ne01,
+            ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+            expert_stride, (uint32_t) x_stride, dst_s1);
+        return;
+    }
+
     if (n_tokens == 1) {
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
             (size_t) n_cols * x_stride);

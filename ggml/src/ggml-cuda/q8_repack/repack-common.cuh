@@ -16,6 +16,10 @@
 // leads from 2 tokens (77.2 against the tile's 14.3) through 8 (159.6 against
 // 98.9), and the tile takes back over by 12, so the crossover is 8 to 12.
 #define MMQ_RP_Q8_MMV_MAX_TOKENS 8
+// MoE narrow batch: at or below this many tokens, run one mat-vec per
+// assignment instead of the tiled GEMM. Expert token counts are per expert, so
+// at these widths nearly every active expert holds a single assignment.
+#define MMQ_RP_Q8_MOE_MMV_MAX_TOKENS 8
 
 template <typename T>
 static __host__ __device__ inline T repack_nsp(const T ne0) {
