@@ -1,7 +1,7 @@
 // Repack buffer type: on upload, supported Q8_0 weights are converted to the
 // gfx906 two-plane layout; everything else is copied through unchanged. Enabled
-// only on gfx906 (the arch the kernels compile for); the Q8_0 path is gated by
-// GGML_CUDA_REPACK_Q8_0 in ggml_cuda_repack_tensor_supported().
+// only on gfx906 (the arch the kernels compile for); which tensors qualify is
+// decided by ggml_cuda_repack_tensor_supported().
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "ggml-cuda.h"
@@ -367,8 +367,9 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_repack_buffer_type_int
     nullptr,
 };
 
-// Repacked buffer type: only enabled on gfx906 with GGML_CUDA_REPACK_Q8_0, else
-// returns nullptr so the caller falls back to the normal CUDA buffer type.
+// Repacked buffer type: gfx906 only, else returns nullptr so the caller falls
+// back to the normal CUDA buffer type. Turning repack off is handled a level
+// up: --no-repack clears use_extra_bufts, so this buft is never asked for.
 // Gating discovery here makes "repack off" fully native: no repack buft is
 // offered to the loader, so no structural repack code (meta supports_op,
 // set_tensor bypass, fusion suppression) is ever active.
