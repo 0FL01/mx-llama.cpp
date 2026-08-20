@@ -93,6 +93,122 @@ static __global__ void k_topk_remap(
     dst[(int64_t) row*k + j] = cand_idx[(int64_t) row*n_cand + pos[(int64_t) row*n_cand + j]];
 }
 
+
+// Direct top-k for small k: one block per row, one pass over the row.
+// Each thread keeps a descending top-K list in registers; the insertion is an
+// unrolled compare-swap cascade so every index stays compile-time and nothing
+// spills. The block then extracts k winners by repeated block-wide argmax.
+// Ties go to the lower index, which is what the argsort path produces.
+template <int K, int NT>
+static __global__ void k_topk_small(const float * __restrict__ x, int * __restrict__ dst,
+                                    const int ncols, const int k) {
+    const int row = blockIdx.x;
+    const float * __restrict__ xr = x + (size_t) row * ncols;
+    int * __restrict__ dr = dst + (size_t) row * k;
+
+    const int tid = threadIdx.x;
+
+    float bv[K];
+    int   bi[K];
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        bv[i] = -INFINITY;
+        bi[i] = INT_MAX;
+    }
+
+    for (int c = tid; c < ncols; c += NT) {
+        const float v = xr[c];
+        // cheap reject: most elements never enter the list
+        if (!(v > bv[K-1] || (v == bv[K-1] && c < bi[K-1]))) {
+            continue;
+        }
+        float cv = v;
+        int   ci = c;
+#pragma unroll
+        for (int p = 0; p < K; ++p) {
+            const bool  gt = (cv > bv[p]) || (cv == bv[p] && ci < bi[p]);
+            const float ov = bv[p];
+            const int   oi = bi[p];
+            bv[p] = gt ? cv : ov;
+            bi[p] = gt ? ci : oi;
+            cv    = gt ? ov : cv;
+            ci    = gt ? oi : ci;
+        }
+    }
+
+    __shared__ float sv[NT * K];
+    __shared__ int   si[NT * K];
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        sv[tid * K + i] = bv[i];
+        si[tid * K + i] = bi[i];
+    }
+    __syncthreads();
+
+    __shared__ float rv[NT];
+    __shared__ int   ri[NT];
+    __shared__ int   rs[NT];
+
+    for (int out = 0; out < k; ++out) {
+        float best_v = -INFINITY;
+        int   best_i = INT_MAX;
+        int   best_s = tid * K;
+#pragma unroll
+        for (int i = 0; i < K; ++i) {
+            const int   slot = tid * K + i;
+            const float v    = sv[slot];
+            const int   c    = si[slot];
+            if (v > best_v || (v == best_v && c < best_i)) {
+                best_v = v;
+                best_i = c;
+                best_s = slot;
+            }
+        }
+        rv[tid] = best_v;
+        ri[tid] = best_i;
+        rs[tid] = best_s;
+        __syncthreads();
+
+        for (int stride = NT / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float ov = rv[tid + stride];
+                const int   oc = ri[tid + stride];
+                if (ov > rv[tid] || (ov == rv[tid] && oc < ri[tid])) {
+                    rv[tid] = ov;
+                    ri[tid] = oc;
+                    rs[tid] = rs[tid + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            dr[out]    = ri[0];
+            sv[rs[0]]  = -INFINITY;   // consume the winner
+            si[rs[0]]  = INT_MAX;
+        }
+        __syncthreads();
+    }
+}
+
+// The candidate array is NT*K*8 bytes, so threads scale inversely with K to
+// hold it at 32 KB. k up to 64 covers the sampler default of 40 as well as the
+// smaller k a speculative drafter uses; above that the sort paths still win.
+static bool top_k_small_cuda(const float * src, int * dst, const int64_t ncols,
+                             const int64_t nrows, const int64_t k, cudaStream_t stream) {
+    const dim3 grid((unsigned) nrows, 1, 1);
+    if (k <= 16) {
+        k_topk_small<16, 256><<<grid, 256, 0, stream>>>(src, dst, (int) ncols, (int) k);
+    } else if (k <= 32) {
+        k_topk_small<32, 128><<<grid, 128, 0, stream>>>(src, dst, (int) ncols, (int) k);
+    } else if (k <= 64) {
+        k_topk_small<64,  64><<<grid,  64, 0, stream>>>(src, dst, (int) ncols, (int) k);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void top_k_hierarchical(ggml_cuda_pool & pool,
                                const float *    src,
                                int *            dst,
@@ -186,7 +302,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
-    if (ncols <= 16384) {
+    // Small k needs no sort: one pass over the row beats sorting it.
+    if (top_k_small_cuda(src0_d, dst_d, ncols, nrows, k, stream)) {
+        // done
+    } else if (ncols <= 16384) {
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
         int *                     tmp_dst = temp_dst_alloc.get();
         argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
