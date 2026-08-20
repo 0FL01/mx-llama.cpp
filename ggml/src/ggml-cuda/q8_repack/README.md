@@ -48,8 +48,8 @@ Three kernel families, chosen per 2D slice:
 |---|---|---|
 | Mat-vec (single token) | `mul_mat_vec_q8_0_repacked<ROWS,NWAVES,HAS_IDS,LANES>` | `ne11 == 1` (dense) / `n_tokens == 1` (MoE) |
 | Mat-vec (narrow batch) | `mul_mat_vec_q8_0_repacked_nc<ROWS,NWAVES,NCOLS,RPL>` | `2 <= ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS`, dense only |
-| GEMM 64-wide | `mmq_gemm_q8_0_repacked<HAS_IDS,TN_,NRL>` | `ne11 >= 128` (dense) / `n_tokens >= MMQ_RP_Q8_MOE_W32_MAX_TOKENS` (MoE) |
-| GEMM 32-wide | `mmq_gemm_q8_0_repacked_w32<HAS_IDS,TN_,NRL>` | `MMQ_RP_Q8_MMV_MAX_TOKENS < ne11 < 128` (dense) / `n_tokens < MMQ_RP_Q8_MOE_W32_MAX_TOKENS` (MoE) |
+| GEMM 64-wide | `mmq_gemm_q8_0_repacked<HAS_IDS,TN_,NRL>` | `ne11 >= 128` (dense) / `n_assign >= 2*BN*n_expert` (MoE) |
+| GEMM 32-wide | `mmq_gemm_q8_0_repacked_w32<HAS_IDS,TN_,NRL>` | `MMQ_RP_Q8_MMV_MAX_TOKENS < ne11 < 128` (dense) / `n_assign < 2*BN*n_expert` (MoE) |
 
 The narrow mat-vec is dense-only. MoE keeps the tile from two tokens up: its
 token counts are per expert, so a narrow ubatch does not imply a narrow tile.

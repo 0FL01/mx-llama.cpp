@@ -10,7 +10,6 @@
 #define MMQ_RP_Q8_TN 2
 #define MMQ_RP_Q8_BM 64
 #define MMQ_RP_Q8_NROW_LANES 4
-#define MMQ_RP_Q8_MOE_W32_MAX_TOKENS 1024
 // Widths at or below this take one multi-column mat-vec pass instead of the
 // tiled GEMM. Measured on Qwen3.8-27B pp512, 4x MI50 -sm tensor: the mat-vec
 // leads from 2 tokens (77.2 against the tile's 14.3) through 8 (159.6 against

@@ -113,13 +113,14 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     }
     const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get();
 
-    // Small ubatch: 32-wide tile GEMM pins column blocks tightly (BN = 32*TN) and
-    // reaches occupancy 3; large ubatch prefers the 64-wide tile (BN = 64*TN).
     // The tile token width is baked into repack_tile_off<BN>, so each path gets its
     // own prefix-sum + tile-meta buffers.
     constexpr int BN_ID   = 64 * MMQ_RP_Q8_TN;      // 64-wide tile
     constexpr int BN_W32  = 32 * 1;                 // 32-wide tile, TN==1
-    const bool use_w32 = n_tokens < MMQ_RP_Q8_MOE_W32_MAX_TOKENS;
+    // The 64-wide tile spills 5 VGPR (occupancy 2 against the 32-wide's 3), so it
+    // only pays once every expert can fill it twice. Columns come per expert, not
+    // per ubatch, which is why the crossover moves with the expert count.
+    const bool use_w32 = n_assign < 2 * BN_ID * ne02;
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0: {
