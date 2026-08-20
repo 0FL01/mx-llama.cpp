@@ -106,39 +106,29 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
 // scratch per device safe: the next tensor's H2D writes are queued after this
 // tensor's repack kernel has read the bytes.
 
-// Device-side repack: one thread per destination sub-block. Reads canonical
-// block_q8_0 (34 B: half d, then 32 int8) and writes the two planes. Padding
-// sub-blocks (blk >= n_blocks) are zeroed, matching repack_q8_0_host().
+// Device-side repack: one thread per sub-block. Reads canonical block_q8_0
+// (34 B: half d, then 32 int8) and writes the row-interleaved layout
+// [qs 32*n_blocks][scales 2*n_blocks] per row at rs bytes.
 static __global__ void repack_q8_0_kernel(
         const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
-        const int64_t ne1, const int64_t n_blocks, const int64_t nsp,
-        const int64_t qs_len, const int64_t src_stride, const int64_t dst_stride,
+        const int64_t ne1, const int64_t n_blocks, const int64_t rs,
+        const int64_t src_stride, const int64_t dst_stride,
         const int64_t total) {
+    const int64_t qoff = n_blocks * 32;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
          i < total; i += (int64_t) gridDim.x * blockDim.x) {
-        const int64_t blk = i % nsp;
-        const int64_t row = (i / nsp) % ne1;
-        const int64_t e   = i / (nsp * ne1);
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
 
-        uint8_t * d_qs = dst + e * dst_stride + (row * nsp + blk) * 32;
-        uint8_t * d_d  = dst + e * dst_stride + qs_len + (row * nsp + blk) * 2;
-
-        if (blk < n_blocks) {
-            const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 34;
+        const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 34;
+        uint8_t * r = dst + e * dst_stride + row * rs;
 #pragma unroll
-            for (int k = 0; k < 32; k++) {
-                d_qs[k] = sb[2 + k];
-            }
-            d_d[0] = sb[0];
-            d_d[1] = sb[1];
-        } else {
-#pragma unroll
-            for (int k = 0; k < 32; k++) {
-                d_qs[k] = 0;
-            }
-            d_d[0] = 0;
-            d_d[1] = 0;
+        for (int k = 0; k < 32; k++) {
+            r[blk * 32 + k] = sb[2 + k];
         }
+        r[qoff + blk * 2 + 0] = sb[0];
+        r[qoff + blk * 2 + 1] = sb[1];
     }
 }
 
@@ -182,17 +172,17 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         const int64_t ne1      = tensor->ne[1];
         const int64_t ne2      = tensor->ne[2];
         const int64_t n_blocks = ne0 / 32;
-        const int64_t nsp      = repack_nsp(ne0);
+        const int64_t rs       = repack_row_stride(ne0);
         const size_t  src_str  = total / ne2;
         const size_t  dst_str  = repack_gcn_nbytes(tensor->type, ne0, ne1);
-        const int64_t n_out    = ne2 * ne1 * nsp;
+        const int64_t n_out    = ne2 * ne1 * n_blocks;
         const int     block    = 256;
         const int     grid     = (int) std::min<int64_t>((n_out + block - 1) / block, 65535);
         switch (tensor->type) {
             case GGML_TYPE_Q8_0:
                 repack_q8_0_kernel<<<grid, block, 0, stream>>>(
-                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, nsp,
-                    ne1 * nsp * 32, (int64_t) src_str, (int64_t) dst_str, n_out);
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, rs,
+                    (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;
             default:
                 GGML_ABORT("unsupported repack type for async upload");

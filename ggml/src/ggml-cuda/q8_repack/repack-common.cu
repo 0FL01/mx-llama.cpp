@@ -31,22 +31,23 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     return src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src);
 }
 
-// Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane
-// [ne1 x nsp]; padding sub-blocks are left zeroed.
+// Host repack of one Q8_0 matrix into the row-interleaved layout: each row is
+// [qs 32*n_blocks][f16 scales 2*n_blocks] at repack_row_stride() bytes.
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
     // a non-multiple ne0 would silently drop the row tail below, so fail loudly instead
     GGML_ASSERT(ne0 % 32 == 0);
     const int64_t n_blocks = ne0 / 32;
-    const int64_t nsp      = repack_nsp(ne0);
-    const size_t  qs_len   = (size_t) ne1 * nsp * 32;
+    const int64_t rs       = repack_row_stride(ne0);
+    const int64_t qoff     = n_blocks * 32;
 
-    memset(dst, 0, qs_len + (size_t) ne1 * nsp * 2);
+    memset(dst, 0, (size_t) ne1 * rs);
 
     for (int64_t row = 0; row < ne1; row++) {
+        uint8_t * r = dst + row * rs;
         for (int64_t blk = 0; blk < n_blocks; blk++) {
             const block_q8_0 * b = &blocks[row * n_blocks + blk];
-            memcpy(dst + (size_t)(row * nsp + blk) * 32, b->qs, 32);
-            memcpy(dst + qs_len + (size_t)(row * nsp + blk) * 2, &b->d, 2);
+            memcpy(r + blk * 32, b->qs, 32);
+            memcpy(r + qoff + blk * 2, &b->d, 2);
         }
     }
 }
@@ -88,17 +89,15 @@ const uint8_t * repack_q8_0_view_get_cached(
     GGML_ASSERT(ne0_v == ne0_b);
     GGML_ASSERT(base->view_src == nullptr);
 
-    const int64_t nsp  = repack_nsp(ne0_v);
+    const int64_t rs = repack_row_stride(ne0_v);
     const uint8_t * base_ptr = (const uint8_t *) base->data;
     const uint8_t * view_ptr = (const uint8_t *) view->data;
 
-    const int64_t row_start = (int64_t)(view_ptr - base_ptr) / (nsp * 32);
-    GGML_ASSERT((view_ptr - base_ptr) % (nsp * 32) == 0);
+    GGML_ASSERT((view_ptr - base_ptr) % rs == 0);
 
-    // Copy every expert in the view (ne1_v x ne2_v), not just ne1_v rows.
-    const size_t qs_size = (size_t) ne1_v * ne2_v * nsp * 32;
-    const size_t sc_size = (size_t) ne1_v * ne2_v * nsp * 2;
-    const size_t total   = qs_size + sc_size;
+    // Rows are self-contained in the row-interleaved layout, so the whole view
+    // (ne1_v x ne2_v rows) is ONE contiguous range.
+    const size_t total = (size_t) ne1_v * ne2_v * rs;
 
     RepackViewCacheKey key{ view->data, ne0_v, ne1_v, ne2_v };
 
@@ -111,14 +110,7 @@ const uint8_t * repack_q8_0_view_get_cached(
     uint8_t * d_ptr;
     CUDA_CHECK(cudaMalloc(&d_ptr, total));
 
-    // QS plane: copy from the view's position in the base QS plane.
-    CUDA_CHECK(cudaMemcpyAsync(d_ptr, view_ptr, qs_size,
-        cudaMemcpyDeviceToDevice, stream));
-
-    // Scale plane: starts after the FULL base QS plane.
-    const uint8_t * src_scales = base_ptr + (size_t) ne1_b * ne2_b * nsp * 32
-                                       + (size_t) row_start * nsp * 2;
-    CUDA_CHECK(cudaMemcpyAsync(d_ptr + qs_size, src_scales, sc_size,
+    CUDA_CHECK(cudaMemcpyAsync(d_ptr, view_ptr, total,
         cudaMemcpyDeviceToDevice, stream));
 
     CUDA_CHECK(cudaStreamSynchronize(stream));

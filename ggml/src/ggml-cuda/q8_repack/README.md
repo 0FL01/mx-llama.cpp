@@ -33,7 +33,7 @@ d plane   [ne1 * nsp *  2 bytes]  f16 scale per 32-value sub-block
 ```
 
 - The `+1` padding sub-block is zeroed (scale 0 contributes nothing).
-- Layout math lives in `repack_nsp()` / `repack_gcn_nbytes()` /
+- Layout math lives in `repack_row_stride()` / `repack_gcn_nbytes()` /
   `repack_q8_0_host()`. Reads back to canonical `block_q8_0` are unsupported:
   weights are write-once, `get_tensor` is nullptr.
 - Multi-expert weights (`ne2 > 1`) concatenate one such layout per expert; the
@@ -131,7 +131,7 @@ Template signature: `<ROWS, NWAVES, HAS_IDS, LANES, HAS_FUSION>`.
 | File | Contents | Used by |
 |---|---|---|
 | `repack.cuh` | Public API (7 functions: buft predicate, buffer-type factory, tensor support, should-fire, dense/MoE/mat-vec-fused dispatch). The only header included outside the folder. | `ggml-cuda.cu` |
-| `repack-common.cuh` | Tuning knobs (`MMQ_RP_Q8_*`), layout math (`repack_nsp`, `repack_gcn_nbytes`), X swizzle (`sX_swizzle<CW>`), device structs (`rp_x_sub`, `block_q8_1_mmq_h`, `sXq_row_q8`), input-gather helpers, DPP warp reduce, host helper declarations. | all TUs in folder |
+| `repack-common.cuh` | Tuning knobs (`MMQ_RP_Q8_*`), layout math (`repack_row_stride`, `repack_gcn_nbytes`), X swizzle (`sX_swizzle<CW>`), device structs (`rp_x_sub`, `block_q8_1_mmq_h`, `sXq_row_q8`), input-gather helpers, DPP warp reduce, host helper declarations. | all TUs in folder |
 | `repack-kernels.cuh` | All device kernels: `repack_tile_off`, `mul_mat_vec_q8_0_repacked` (optional `HAS_FUSION` epilogue), `mmq_gemm_q8_0_repacked_impl` + 64/32-wide launch wrappers, `repack_tile_meta`. GCN-guarded, `NO_DEVICE_CODE` elsewhere. | `mul-mat.cu`, `mul-mat-id.cu` |
 | `repack-common.cu` | `ggml_cuda_repack_tensor_supported()`, `ggml_cuda_repack_mul_mat_should_fire()` (also handles views), host repack `repack_q8_0_host()`, persistent per-view cache `repack_q8_0_view_get_cached`. | `mul-mat.cu`, `mul-mat-id.cu`, `buffer.cu`, `ggml-cuda.cu` |
 | `mul-mat.cu` | Dense entry `ggml_cuda_mul_mat_repacked()` + per-slice dispatcher, dense fused host `ggml_cuda_mul_mat_vec_repacked_fused()`. | `ggml-cuda.cu` |
