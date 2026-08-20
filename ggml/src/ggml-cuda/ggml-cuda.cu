@@ -4529,16 +4529,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * ids  = up->src[2];
 
             // Repacked weights: fuse the up/gate dot products in the MMV kernel
-            // (both lanes share the same quantized input). Dense single-token
-            // only: MoE (ids) and prefill (ne[1] > 1) fall through to the GEMM.
+            // (both lanes share the same quantized input, and for MoE the same
+            // expert lookup). Single token only, dense and MoE: prefill falls
+            // through to the repacked GEMM. Without this the repacked path runs
+            // up, gate and the GLU as three launches where the canonical path
+            // runs one, which is the whole of its decode deficit.
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
-                ids == nullptr && glu->ne[1] == 1) {
+                (ids == nullptr ? glu->ne[1] == 1 : glu->ne[2] == 1)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
+                if (ids == nullptr) {
+                    ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
+                } else {
+                    ggml_cuda_mul_mat_id_vec_repacked_fused(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;

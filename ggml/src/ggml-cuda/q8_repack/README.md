@@ -14,9 +14,10 @@ The folder is self-contained: the only header seen outside is `repack.cuh`
 2. **Compute dispatch** - `ggml_cuda_mul_mat{,_id}` route to the repacked
    kernels when `ggml_cuda_repack_mul_mat_should_fire(src0)` is true.
 3. **Fused FFN / bias-only dispatch** - the repacked MMV implements fused
-   epilogues (dual accumulator + GLU / `+bias`), so `{MM, MM, GLU}` and
-   `{MM, ADD}` subgraphs are fused for repacked weights via explicit branches in
-   `ggml_cuda_try_fuse`. The canonical-layout fused kernels stay suppressed.
+   epilogues (dual accumulator + GLU / `+bias`), so `{MM, MM, GLU}`,
+   `{MM_ID, MM_ID, GLU}` and `{MM, ADD}` subgraphs are fused for repacked
+   weights via explicit branches in `ggml_cuda_try_fuse`. The canonical-layout
+   fused kernels stay suppressed.
 
 ## The repacked weight layout
 
@@ -68,7 +69,7 @@ per row; current instantiations use `WPR=1`). `LANES` lanes split each 32-value
 sub-block into two 16-value halves (`n_half = 2 * n_blocks`) and stride over
 them; per element a `dp4a` over 4 int32 words, scaled by `dw * dx`, reduced
 with `rp_warp_reduce_sum<LANES>` (DPP intrinsics on GCN, `warp_reduce_sum`
-elsewhere). `LANES` = 64 for dense, 16 for MoE.
+elsewhere). `LANES` = 64 for dense, 16 for MoE, 32 for the fused MoE MMV.
 
 **GEMM.** Tile is `BM` rows x `BN = CW x TN_` cols x `BK` sub-blocks deep. Data
 flows global -> registers (prefetch) -> shared (`sW_lo/sW_hi`, weight scales
@@ -87,13 +88,16 @@ which exposes the same 64 bytes as `float d4[4]` instead of the stock `half2`
 union, so activation scales read directly as f32 (no extra fp16->fp32 pass).
 Three `static_assert`s pin size and field offsets to the stock layout.
 
-**Fused MMV (repacked FFN / bias-only).** Dense single-token only
-(`ne[1] == 1`; MoE and prefill fall through to the GEMM):
+**Fused MMV (repacked FFN / bias-only).** Single token only, dense `ne[1] == 1`
+and MoE `ne[2] == 1`. Anything wider, including every step of a speculative
+verify batch and every multi-slot decode, falls through to the narrow mat-vec
+or the GEMM:
 
 | Fusion | Pattern | Kernel instantiation |
 |---|---|---|
 | GLU | `{MM, MM, GLU}` | `<16,16,false,64,true>` (gate lane) |
 | bias-only | `{MM, ADD}` | `<16,16,false,64,true>` (no gate lane) |
+| MoE GLU | `{MM_ID, MM_ID, GLU}` | `<8,4,true,32,true>` (gate lane) |
 
 Template signature: `<ROWS, NWAVES, HAS_IDS, LANES, HAS_FUSION>`.
 
@@ -111,7 +115,16 @@ Template signature: `<ROWS, NWAVES, HAS_IDS, LANES, HAS_FUSION>`.
   (`should_fire(src0) && should_fire(gate->src[0])`), so a mixed up-repacked /
   gate-canonical state can never reach a kernel that reads `gate->data` as
   repacked layout.
-- MoE fused GLU is not wired up yet; MoE FFNs fall through to the repacked GEMM.
+- MoE fusion covers the plain `{MM_ID, MM_ID, GLU}` shape only. Per-expert bias
+  (`{MM_ID, ADD_ID, MM_ID, ADD_ID, GLU}`) and the per-expert scale subgraph are
+  separate branches in `ggml_cuda_try_fuse` and are not wired up.
+- With ids, the gate base is advanced per routed expert alongside `wbase`.
+  Without that every assignment reads expert 0's gate weights.
+- MoE geometry is `<8,4,32>`, not the dense `<16,16,64>`. A 1024-thread
+  workgroup is 16 waves, 4 per SIMD, which caps registers at 64 per lane, and a
+  fused MoE row does not fit that: traced against up and gate as separate
+  kernels, MoE mat-vec time per token is +3.5% at `<64,16,16>` and -15.9% at
+  `<8,4,32>`.
 
 ## Files
 
@@ -189,6 +202,8 @@ numbers land in `compiled_kernel_stats/`.
 
 ## Known gaps
 
-- MoE fused GLU is not wired up (MoE FFNs use the unfused GEMM).
+- MoE fused GLU covers only the no-bias `{MM_ID, MM_ID, GLU}` shape, and only at
+  one token. Bias and scale subgraphs, and every batch wider than one token, use
+  the unfused path.
 - Only Q8_0 is supported by the two-plane machinery.
 

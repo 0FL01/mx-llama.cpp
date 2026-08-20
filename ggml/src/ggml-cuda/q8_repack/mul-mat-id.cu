@@ -149,3 +149,77 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         default: GGML_ABORT("unsupported repack type");
     }
 }
+
+// Fused MMV entry for repacked weights (MoE): single-token only, fuses the up
+// and gate dot products (shared quantized input, shared expert lookup) plus
+// optional biases and the GLU op.
+// Dispatch: ggml_cuda_try_fuse `{op,op,GLU}` repack branch.
+void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->nb[0]  == sizeof(int32_t));
+    GGML_ASSERT(dst->nb[1]  == (size_t) dst->ne[0] * sizeof(float));
+    GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);   // fused MMV is single-token only
+    GGML_ASSERT(ids->ne[1] == 1);
+    GGML_ASSERT(fusion != nullptr && fusion->gate != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && fusion->gate->type == GGML_TYPE_Q8_0);
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne10 = src1->ne[0];
+    GGML_ASSERT(ne10 == ne00);
+    const int64_t n_assign = ids->ne[0];
+
+    cudaStream_t stream = ctx.stream();
+
+    const uint8_t * w;
+    if (src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src)) {
+        w = repack_q8_0_view_get_cached(src0, src0->view_src, stream);
+    } else {
+        w = (const uint8_t *) src0->data;
+    }
+
+    const ggml_tensor * gate = fusion->gate;
+    const uint8_t * w_gate;
+    if (gate->view_src != nullptr && ggml_cuda_repack_tensor_supported(gate->view_src)) {
+        w_gate = repack_q8_0_view_get_cached(gate, gate->view_src, stream);
+    } else {
+        w_gate = (const uint8_t *) gate->data;
+    }
+
+    // ADD_ID bias is [ne01, n_expert]; the kernel indexes it as expert*ne01 + row.
+    const float * x_bias    = fusion->x_bias    ? (const float *) fusion->x_bias->data    : nullptr;
+    const float * gate_bias = fusion->gate_bias ? (const float *) fusion->gate_bias->data : nullptr;
+
+    const size_t   expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
+    const uint32_t dst_s1        = dst->nb[1] / sizeof(float);
+    const int64_t  ne10_padded   = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t  x_stride      = ne10_padded / QK8_1;
+    const int64_t  n_cols        = src1->ne[1] * src1->ne[2];
+    const int64_t  s11           = src1->nb[1] / sizeof(float);
+
+    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(), (size_t) n_cols * x_stride);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
+        src0->type, ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded,
+        n_cols, 1, 1, stream);
+
+    // Eight rows per block, four waves, 32 lanes to a row. Seven geometries
+    // were traced at decode and lane width dominates: a 1024-thread workgroup
+    // is 16 waves, 4 per SIMD, which caps registers at 64 per lane, and fusion
+    // doubles the live weight state. Against up and gate as separate kernels,
+    // MoE mat-vec time per token:
+    //   <64,16,16> 1024thr  +3.5%      <16,16,64> 1024thr  -6.2%
+    //   < 8, 2,16>  128thr -10.1%      < 8, 4,32>  256thr -15.9%
+    const dim3 grid((ne01 + 7) / 8, (unsigned) n_assign, 1);
+    mul_mat_vec_q8_0_repacked<8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
+        w, src1_q8_1.get(), (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+        (const int32_t *) ids->data, nullptr, nullptr,
+        (uint32_t) ne02, (uint32_t) src1->ne[1], expert_stride,
+        (uint32_t) x_stride, dst_s1,
+        w_gate, x_bias, gate_bias, fusion->glu_op);
+}

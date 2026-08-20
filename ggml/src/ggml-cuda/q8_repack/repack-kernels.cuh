@@ -111,6 +111,13 @@ static __global__ void mul_mat_vec_q8_0_repacked(
         const uint32_t e = (uint32_t) ids_src1[a];
         expert = e;
         wbase += e * expert_stride;
+        if constexpr (HAS_FUSION) {
+            // The gate matrix is per expert too - without this every assignment
+            // reads expert 0's gate weights.
+            if (use_gate) {
+                wbase_gate += e * expert_stride;
+            }
+        }
         xq    += (size_t)(a % nchannels_y) * xs_id;
         y     += (size_t) a * dst_s1;
         GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
