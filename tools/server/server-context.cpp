@@ -535,8 +535,11 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // Discard deferred draft state and any target-only prompt cache.
+            const bool speculative_prompt_invalid = common_speculative_reset(spec, id);
+
+            // Do not keep context of child slots - the parent's context is enough.
+            if (task->is_child() || speculative_prompt_invalid) {
                 prompt_clear();
             }
 

@@ -192,6 +192,9 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // Return true if the reset invalidates the shared target/draft prompt cache.
+    virtual bool reset(llama_seq_id /*seq_id*/) { return false; }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1250,6 +1253,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool flush_pending() {
         return flush_pending_upto(pending.size());
+    }
+
+    bool reset(llama_seq_id seq_id) override {
+        const size_t n_before = pending.size();
+        pending.erase(std::remove_if(pending.begin(), pending.end(),
+                    [seq_id](const pending_chunk & chunk) {
+                        return chunk.seq_id == seq_id;
+                    }), pending.end());
+
+        const size_t n_discarded = n_before - pending.size();
+        if (n_discarded > 0) {
+            LOG_INF("%s: discarded %zu deferred prompt chunks for sequence %d\n",
+                    __func__, n_discarded, (int) seq_id);
+        }
+
+        if (seq_id >= 0 && seq_id < (llama_seq_id) smpls.size()) {
+            common_sampler_reset(smpls[seq_id].get());
+        }
+
+        // Deferred chunks have reached the target context but not the draft context.
+        return n_discarded > 0;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -3254,6 +3278,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+bool common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->dparams.size()) {
+        return false;
+    }
+
+    bool prompt_invalidated = false;
+    for (auto & impl : spec->impls) {
+        prompt_invalidated = impl->reset(seq_id) || prompt_invalidated;
+    }
+
+    spec->dparams[seq_id].drafting = false;
+    spec->impl_last[seq_id] = nullptr;
+
+    return prompt_invalidated;
 }
 
 // TODO: support the case of more than one speculative implementations having a state
