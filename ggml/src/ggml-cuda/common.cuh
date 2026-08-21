@@ -1179,6 +1179,10 @@ struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
+    // Pools without recovery keep the regular fail-fast behavior.
+    virtual void * try_alloc(size_t size, size_t * actual_size) {
+        return alloc(size, actual_size);
+    }
     virtual void free(void * ptr, size_t size) = 0;
 };
 
@@ -1198,9 +1202,7 @@ struct ggml_cuda_pool_alloc {
     }
 
     ~ggml_cuda_pool_alloc() {
-        if (ptr != nullptr) {
-            pool->free(ptr, actual_size);
-        }
+        reset();
     }
 
     // size is in number of elements
@@ -1214,6 +1216,21 @@ struct ggml_cuda_pool_alloc {
     T * alloc(ggml_cuda_pool & pool, size_t size) {
         this->pool = &pool;
         return alloc(size);
+    }
+
+    T * try_alloc(size_t size) {
+        GGML_ASSERT(pool != nullptr);
+        GGML_ASSERT(ptr == nullptr);
+        ptr = (T *) pool->try_alloc(size * sizeof(T), &this->actual_size);
+        return ptr;
+    }
+
+    void reset() {
+        if (ptr != nullptr) {
+            pool->free(ptr, actual_size);
+            ptr = nullptr;
+            actual_size = 0;
+        }
     }
 
     T * get() {
@@ -1448,6 +1465,10 @@ struct ggml_backend_cuda_context {
     cudaEvent_t  pp_copy_event_b = nullptr; // pp_copy_stream -> dst main
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+
+    // Remember a smaller split flash-attention workspace after an allocation failure.
+    int fattn_parallel_blocks_cap = 0;
+    bool fattn_parallel_blocks_override_logged = false;
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
 #if defined(GGML_USE_HIP)

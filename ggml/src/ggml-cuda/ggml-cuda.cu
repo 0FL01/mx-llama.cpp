@@ -452,7 +452,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc_impl(size_t size, size_t * actual_size, bool fallible) {
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -507,6 +507,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
         }
+        if (fallible && err == cudaErrorMemoryAllocation) {
+            (void) cudaGetLastError();
+            *actual_size = 0;
+            return nullptr;
+        }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
@@ -515,6 +520,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
 #endif
         return ptr;
+    }
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, false);
+    }
+
+    void * try_alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, true);
     }
 
     void free(void * ptr, size_t size) override {

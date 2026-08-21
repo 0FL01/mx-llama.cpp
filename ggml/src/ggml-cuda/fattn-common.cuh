@@ -1177,14 +1177,47 @@ void launch_fattn(
             }
         }
 
+        // Allow reproducing the automatic low-memory path without an OOM.
+        static const int max_parallel_blocks = []() {
+            const char * value = getenv("GGML_CUDA_FATTN_MAX_PARALLEL_BLOCKS");
+            return value != nullptr ? std::max(0, atoi(value)) : 0;
+        }();
+        if (max_parallel_blocks > 0 && parallel_blocks > max_parallel_blocks) {
+            if (!ctx.fattn_parallel_blocks_override_logged) {
+                GGML_LOG_INFO("%s: device %d limiting flash-attention workspace from %d to %d parallel blocks "
+                        "via GGML_CUDA_FATTN_MAX_PARALLEL_BLOCKS\n",
+                        __func__, id, parallel_blocks, max_parallel_blocks);
+                ctx.fattn_parallel_blocks_override_logged = true;
+            }
+            parallel_blocks = std::min(parallel_blocks, max_parallel_blocks);
+        }
+        if (ctx.fattn_parallel_blocks_cap > 0) {
+            parallel_blocks = std::min(parallel_blocks, ctx.fattn_parallel_blocks_cap);
+        }
+
         blocks_num.x = ntiles_x;
-        blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
-        if (parallel_blocks > 1) {
-            dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
-            dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+        while (parallel_blocks > 1) {
+            const bool have_dst = dst_tmp.try_alloc(parallel_blocks*ggml_nelements(KQV)) != nullptr;
+            const bool have_meta = have_dst &&
+                dst_tmp_meta.try_alloc(parallel_blocks*ggml_nrows(KQV)) != nullptr;
+            if (have_meta) {
+                break;
+            }
+
+            dst_tmp_meta.reset();
+            dst_tmp.reset();
+
+            const int failed_blocks = parallel_blocks;
+            parallel_blocks = std::max(1, parallel_blocks/2);
+            ctx.fattn_parallel_blocks_cap = ctx.fattn_parallel_blocks_cap > 0
+                ? std::min(ctx.fattn_parallel_blocks_cap, parallel_blocks)
+                : parallel_blocks;
+            GGML_LOG_WARN("%s: device %d flash-attention workspace did not fit at %d parallel blocks; retrying with %d\n",
+                    __func__, id, failed_blocks, parallel_blocks);
         }
+        blocks_num.y = parallel_blocks;
     }
 
     float scale         = 1.0f;
