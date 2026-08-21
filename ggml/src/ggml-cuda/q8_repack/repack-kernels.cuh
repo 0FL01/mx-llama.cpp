@@ -125,7 +125,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, nchannels_y, expert_stride, xs_id, dst_s1);
     }
     const uint32_t n_blocks = ne0 >> 5;
-    const uint32_t rs       = repack_row_stride(ne0);
+    const uint32_t qs_str   = repack_qs_stride(ne0);
 
     const int warp_id   = threadIdx.x / LANES;
     const int lane      = threadIdx.x % LANES;
@@ -134,18 +134,18 @@ static __global__ void mul_mat_vec_q8_0_repacked(
     const int row       = blockIdx.x * ROWS + row_local;
 
     const uint32_t wrow     = min((uint32_t) row, ne1 - 1);
-    const uint8_t  * row_b  = wbase + (size_t) wrow * rs;
-    const uint4    * w_row  = reinterpret_cast<const uint4 *>(row_b);
-    const uint16_t * d_row  = reinterpret_cast<const uint16_t *>(row_b + (size_t) n_blocks * 32);
+    const uint4    * w_row  = reinterpret_cast<const uint4 *>(wbase + (size_t) wrow * qs_str);
+    const uint16_t * d_row  = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * qs_str) + (size_t) wrow * n_blocks;
     const uint16_t rmask  = (row < (int) ne1) ? (uint16_t) 0xffffu : (uint16_t) 0x0000u;
 
     [[maybe_unused]] const uint4 * w_row_gate = nullptr;
     [[maybe_unused]] const uint16_t * d_row_gate = nullptr;
     if constexpr (HAS_FUSION) {
         if (use_gate) {
-            const uint8_t * row_g = wbase_gate + (size_t) wrow * rs;
-            w_row_gate = reinterpret_cast<const uint4 *>(row_g);
-            d_row_gate = reinterpret_cast<const uint16_t *>(row_g + (size_t) n_blocks * 32);
+            w_row_gate = reinterpret_cast<const uint4 *>(wbase_gate + (size_t) wrow * qs_str);
+            d_row_gate = reinterpret_cast<const uint16_t *>(
+                wbase_gate + (size_t) ne1 * qs_str) + (size_t) wrow * n_blocks;
         }
     }
 
@@ -422,10 +422,11 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
     }
 
     const uint32_t n_sub = ne0 >> 5;
-    const uint32_t rs    = repack_row_stride(ne0);
-    const uint32_t rs_u4 = rs >> 4;
-    const uint32_t qoff  = n_sub * 32;
+    const uint32_t qs_str = repack_qs_stride(ne0);
+    const uint32_t qs_u4  = qs_str >> 4;
     const uint4    * __restrict__ qsp = reinterpret_cast<const uint4 *>(wbase);
+    const uint16_t * __restrict__ dp  = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * qs_str);
     const block_q8_1_mmq_h * __restrict__ xmmq = reinterpret_cast<const block_q8_1_mmq_h *>(xq);
 
     const block_q8_1_mmq_h * x_group = xmmq;
@@ -487,11 +488,10 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
             const uint32_t sb   = sb0 + lk;
             const uint32_t wrow = row0 + lr;
             if (wrow < ne1 && sb < n_sub) {
-                const size_t q4 = (size_t) wrow * rs_u4 + 2 * sb;
+                const size_t q4 = (size_t) wrow * qs_u4 + 2 * (size_t) sb;
                 pw_lo[i] = rp_ldcs_u4(qsp + q4);
                 pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
-                pw_d [i] = *reinterpret_cast<const uint16_t *>(
-                    wbase + (size_t) wrow * rs + qoff + 2 * sb);
+                pw_d [i] = dp[(size_t) wrow * n_sub + sb];
             } else {
                 pw_d[i] = 0;
             }
@@ -536,13 +536,12 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
             const int lk = e % MMQ_RP_Q8_BK;
 
             const uint32_t wrow = row0 + lr;
-            const uint32_t sb   = sb0 + lk;
-            const size_t   q4   = (size_t) wrow * rs_u4 + 2 * sb;
+            const uint32_t sbi  = sb0 + lk;
+            const size_t   q4   = (size_t) wrow * qs_u4 + 2 * (size_t) sbi;
 
             pw_lo[i] = rp_ldcs_u4(qsp + q4);
             pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
-            pw_d [i] = *reinterpret_cast<const uint16_t *>(
-                wbase + (size_t) wrow * rs + qoff + 2 * sb);
+            pw_d [i] = dp[(size_t) wrow * n_sub + sbi];
         }
     };
 
@@ -779,7 +778,7 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
     const int row     = blockIdx.x * ROWS + warp_id * RPL;
 
     const uint32_t n_blocks = ne0 >> 5;
-    const uint32_t rs       = repack_row_stride(ne0);
+    const uint32_t qs_str   = repack_qs_stride(ne0);
 
     // RPL rows per lane: the activation block is loaded once into registers and
     // reused against every row the lane owns, so the activation side stops
@@ -791,11 +790,11 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
     uint16_t         rmasks[RPL];
 #pragma unroll
     for (int r = 0; r < RPL; ++r) {
-        const int      rr    = row + r;
-        const uint32_t wrow  = min((uint32_t) rr, ne1 - 1);
-        const uint8_t * row_b = wbase + (size_t) wrow * rs;
-        w_rows[r] = reinterpret_cast<const uint4 *>(row_b);
-        d_rows[r] = reinterpret_cast<const uint16_t *>(row_b + (size_t) n_blocks * 32);
+        const int      rr   = row + r;
+        const uint32_t wrow = min((uint32_t) rr, ne1 - 1);
+        w_rows[r] = reinterpret_cast<const uint4 *>(wbase + (size_t) wrow * qs_str);
+        d_rows[r] = reinterpret_cast<const uint16_t *>(
+            wbase + (size_t) ne1 * qs_str) + (size_t) wrow * n_blocks;
         rmasks[r] = (rr < (int) ne1) ? (uint16_t) 0xffffu : (uint16_t) 0x0000u;
     }
 

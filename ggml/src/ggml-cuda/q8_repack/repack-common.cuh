@@ -20,17 +20,15 @@
 // at these widths nearly every active expert holds a single assignment.
 #define MMQ_RP_Q8_MOE_MMV_MAX_TOKENS 8
 
-// Row-interleaved layout: each row is [qs 32*n_sub][f16 scales 2*n_sub], padded
-// to 16 B, then bumped by 16 whenever the stride lands on a multiple of 128 B.
-// Power-of-two row strides alias HBM channels (removing de-aliasing costs
-// 9-15% of decode); the old +1-sub-block pad de-aliased too but cost up to
-// +6.25% VRAM on ne0=512 tensors. 34 = 2*17 is odd-factored, so most strides
-// de-alias for free and the bump fires only on n_sub % 64 == 0 shapes.
+// qs plane row stride in BYTES: ne0 (one byte per quant), bumped by 16 whenever
+// it lands on a multiple of 128 so row starts do not alias HBM channels. 16
+// keeps uint4 alignment and costs half of the padding sub-block it replaces,
+// which also only fired when n_sub was a power of two and so missed shapes like
+// ne0=5120. Scales keep their own plane: the narrow mat-vec reads several rows
+// per lane and wants them adjacent.
 template <typename T>
-static __host__ __device__ inline T repack_row_stride(const T ne0) {
-    const T n_sub = ne0 / 32;
-    T rs = n_sub * 34;
-    rs = (rs + 15) & ~T(15);
+static __host__ __device__ inline T repack_qs_stride(const T ne0) {
+    T rs = ne0;
     if (rs % 128 == 0) {
         rs += 16;
     }
@@ -40,7 +38,8 @@ static __host__ __device__ inline T repack_row_stride(const T ne0) {
 static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, const int64_t ne1) {
     GGML_ASSERT(ne0 % 32 == 0);
     switch (type) {
-        case GGML_TYPE_Q8_0: return (size_t) ne1 * repack_row_stride(ne0);
+        case GGML_TYPE_Q8_0:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0) + (size_t)(ne0 / 32) * 2);
         default:             GGML_ABORT("unsupported repack type");
     }
 }
