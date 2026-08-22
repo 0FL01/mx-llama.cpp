@@ -130,10 +130,28 @@ static void ggml_cuda_mul_mat_repacked_nc(const ggml_tensor * src0,
     // iterations against a 4-step reduction while cutting the grid by 16x -
     // the row is simply too short to pay for the lost parallelism. Gate on the
     // block count so the choice follows the shape and not the model.
-    const bool long_row = (ne00 / 32) >= 128;
+    // Narrowing the lane group raises the work a lane does before it reduces,
+    // and multiplies the rows a block covers, which shrinks the grid. Both
+    // have a floor and BOTH must hold.
+    //
+    // A lane accumulates n_blocks/LANES times, then pays a log2(LANES)-step
+    // reduction, so require at least four accumulations at the widest group we
+    // would narrow to. Measured on two models: 160 and 128 blocks win, 64
+    // loses at every lane width, so the break is between them.
+    //
+    // The grid condition is what the row length alone cannot see - a 48-row
+    // tensor is a 2-block grid however long its rows are.
+    constexpr int RP_NC_MIN_ACCUM   = 4;
+    constexpr int RP_NC_LANES_WIDE  = 32;   // widest group we ever narrow to
+    const int     nsm       = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int64_t n_blocks  = ne00 / 32;
+    const int64_t min_grid  = 2LL * nsm;
+    const bool    work_ok   = n_blocks >= RP_NC_MIN_ACCUM * RP_NC_LANES_WIDE;
+    const bool    lanes16_ok = work_ok && (ne01 + 31) / 32 >= min_grid;
+    const bool    lanes32_ok = work_ok && (ne01 +  7) /  8 >= min_grid;
     switch (ne11) {
         case 2: {
-            if (long_row) {
+            if (lanes16_ok) {
                 // 16 lanes to a row, 32 rows per block, one row per lane.
                 const dim3 grid((ne01 + 31) / 32, 1, 1);
                 mul_mat_vec_q8_0_repacked_nc<32, 8, 2, 1, 16><<<grid, 512, 0, stream>>>(
@@ -145,7 +163,7 @@ static void ggml_cuda_mul_mat_repacked_nc(const ggml_tensor * src0,
             }
         } break;
         case 3: {
-            if (long_row) {
+            if (lanes32_ok) {
                 // 32 lanes to a row, 8 rows per block, one row per lane.
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
                 mul_mat_vec_q8_0_repacked_nc<8, 4, 3, 1, 32><<<grid, 256, 0, stream>>>(
