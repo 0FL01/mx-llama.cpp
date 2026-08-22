@@ -765,7 +765,8 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
 // weights once and keeping one accumulator per token amortizes the weight
 // traffic the same way, on the repacked layout. Dense only: the single-token
 // path and the MoE ids path keep their existing kernels.
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false>
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false,
+          int LANES = 64>
 static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -774,8 +775,16 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
         const float * __restrict__ gate_bias, const ggml_glu_op glu_op,
         const uint32_t bias_row_base) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    constexpr int LANES = 64;
-    static_assert(ROWS == NWAVES * RPL, "row geometry");
+    // LANES is the number of lanes cooperating on ONE row. It is the geometry
+    // knob that matters here: the strided loop runs n_blocks/LANES iterations
+    // and is then followed by a log2(LANES)-step DPP reduction, so a wide lane
+    // group on a short row spends most of its time reducing. At ne0=5120,
+    // n_blocks is 160, which is 2.5 iterations at 64 lanes against a 6-step
+    // reduction, and 10 iterations at 16 lanes against a 4-step one.
+    constexpr int NWARPS = (NWAVES * 64) / LANES;
+    static_assert(LANES >= 1 && LANES <= 64 && (LANES & (LANES - 1)) == 0,
+                  "LANES must be a power of two, at most one wave");
+    static_assert(ROWS == NWARPS * RPL, "row geometry");
     const int warp_id = threadIdx.x / LANES;
     const int lane    = threadIdx.x % LANES;
     const int row     = blockIdx.x * ROWS + warp_id * RPL;
@@ -909,12 +918,12 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
 #endif
 }
 
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1>
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64>
 static __global__ void mul_mat_vec_q8_0_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
-    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false>(
+    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES>(
         wbase, xq, y, ne0, ne1, xs, ys, nullptr, nullptr, nullptr,
         GGML_GLU_OP_REGLU, 0);
 }
