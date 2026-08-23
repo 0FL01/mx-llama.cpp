@@ -3,6 +3,7 @@
 
 #include "../common.cuh"
 #include "../mmq.cuh"
+#include "../quantize.cuh"
 
 #include <cstddef>
 
@@ -166,3 +167,39 @@ const uint8_t * repack_q8_0_view_get_cached(
 // owning buffer is freed so the allocator cannot hand the same addresses to a
 // different model and hit a stale entry.
 void repack_view_cache_purge(int device, const void * base, size_t size);
+
+// Quantize src1 into Q8_1 rows, reusing the graph-wide activation cache when the
+// same activation was already quantized to this exact layout. One activation
+// feeds several matmuls back to back - q/k/v off one attention norm, router and
+// routed gate/up off one ffn norm - and each re-quantized its own copy, so the
+// launch count tracked the matmul count exactly. quantize_row_q8_1_cuda ignores
+// type_src0 and always writes the plain row layout, so variant 0 is the same
+// layout the canonical mat-vec caches under and the two share entries. The MoE
+// sites pass the rows flattened as (n_cols, 1, 1) where the dense sites pass
+// (ne11, ne12, ne13). That is still the same bytes: the kernel writes
+// i_cont = ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0, which is contiguous either way,
+// and it can only collide in the cache when the strides and the size already
+// match, which is the contiguous case where both walk src1 identically.
+// Fusing the quantize into the mat-vec instead is the wrong shape: it is a
+// shared producer, and making every block re-quantize the row cost 42 percent.
+static inline block_q8_1 * repack_quantize_src1_q8_1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        int64_t ne10, int64_t ne10_padded, int64_t s11, int64_t s12, int64_t s13,
+        int64_t nrows, int64_t ne2, int64_t ne3, size_t nblocks,
+        ggml_cuda_pool_alloc<block_q8_1> & fallback, cudaStream_t stream) {
+    bool hit = false;
+    char * cached = ggml_cuda_q8_1_cache_acquire(ctx, src1, /*variant =*/ 0, ne10_padded,
+                                                 s11, s12, s13, nblocks * sizeof(block_q8_1), hit);
+    block_q8_1 * dstq;
+    if (cached) {
+        dstq = (block_q8_1 *) cached;
+    } else {
+        fallback.alloc(ctx.pool(), nblocks);
+        dstq = fallback.get();
+    }
+    if (!hit) {
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, dstq,
+            src0->type, ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+    }
+    return dstq;
+}

@@ -63,29 +63,26 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // 32-wide tile per active expert.
     if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS &&
         src0->type == GGML_TYPE_Q8_0) {
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
-            (size_t) n_cols * x_stride);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded,
-            n_cols, 1, 1, stream);
+        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+        block_q8_1 * src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+            ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+            (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
 
         // Four rows per block, two waves. Five geometries were measured at
         // the verify widths and all landed within five percent; this was best.
         const dim3 grid((ne01 + 3) / 4, (unsigned) n_assign, 1);
         mul_mat_vec_q8_0_repacked_id1<4, 2, 2><<<grid, 128, 0, stream>>>(
-            w, src1_q8_1.get(), dst_d, (uint32_t) ne00, (uint32_t) ne01,
+            w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
             ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
             expert_stride, (uint32_t) x_stride, dst_s1);
         return;
     }
 
     if (n_tokens == 1) {
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
-            (size_t) n_cols * x_stride);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded,
-            n_cols, 1, 1, stream);
-        const block_q8_1 * xq = src1_q8_1.get();
+        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+        const block_q8_1 * xq = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+            ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+            (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
         const uint32_t nchannels_y = (uint32_t) src1->ne[1];
         const uint32_t xs_id       = (uint32_t) x_stride;
         switch (src0->type) {
@@ -207,10 +204,10 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const int64_t  n_cols        = src1->ne[1] * src1->ne[2];
     const int64_t  s11           = src1->nb[1] / sizeof(float);
 
-    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(), (size_t) n_cols * x_stride);
-    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-        src0->type, ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded,
-        n_cols, 1, 1, stream);
+    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+    block_q8_1 * src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+        ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+        (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
 
     // Eight rows per block, four waves, 32 lanes to a row. Seven geometries
     // were traced at decode and lane width dominates: a 1024-thread workgroup
@@ -236,7 +233,7 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         // One row per lane, four waves. Two rows per lane costs a spill and
         // drops occupancy from 6 to 4 once the gate matrix shares the loop.
         mul_mat_vec_q8_0_repacked_id1_fused<4, 4, 1><<<grid_nc, 256, 0, stream>>>(
-            w, src1_q8_1.get(), (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
             ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
             expert_stride, (uint32_t) x_stride, dst_s1,
             w_gate, x_bias, gate_bias, fusion->glu_op);
@@ -245,7 +242,7 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
 
     const dim3 grid((ne01 + 7) / 8, (unsigned) n_assign, 1);
     mul_mat_vec_q8_0_repacked<8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
-        w, src1_q8_1.get(), (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+        w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
         (const int32_t *) ids->data, nullptr, nullptr,
         (uint32_t) ne02, (uint32_t) src1->ne[1], expert_stride,
         (uint32_t) x_stride, dst_s1,

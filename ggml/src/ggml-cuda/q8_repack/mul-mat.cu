@@ -47,19 +47,20 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
         // tiled path below computes a full 32-wide tile whatever the batch is.
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
-            ne13 * ne12 * ne11 * x_stride);
+        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+        block_q8_1 * src1_q8_1_d;
         {
             const int64_t s11 = src1->nb[1] / sizeof(float);
             const int64_t s12 = src1->nb[2] / sizeof(float);
             const int64_t s13 = src1->nb[3] / sizeof(float);
-            quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-                src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10, ne10_padded,
+                s11, s12, s13, ne11, ne12, ne13,
+                (size_t) (ne13 * ne12 * ne11 * x_stride), src1_q8_1_own, stream);
         }
         const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
-            const block_q8_1 * xq = src1_q8_1.get()
+            const block_q8_1 * xq = src1_q8_1_d
                               + (i3 * ne12 + i2) * ne11 * x_stride;
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
             if (ne11 == 1) {
@@ -289,18 +290,19 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t x_stride    = ne10_padded / QK8_1;
 
-    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1(ctx.pool(),
-        ne13 * ne12 * x_stride);
+    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+    block_q8_1 * src1_q8_1_d;
     {
         const int64_t s11 = src1->nb[1] / sizeof(float);
         const int64_t s12 = src1->nb[2] / sizeof(float);
         const int64_t s13 = src1->nb[3] / sizeof(float);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s12, s13, ne10_padded, 1, ne12, ne13, stream);
+        src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10, ne10_padded,
+            s11, s12, s13, 1, ne12, ne13,
+            (size_t) (ne13 * ne12 * x_stride), src1_q8_1_own, stream);
     }
     for (int64_t i3 = 0; i3 < ne13; i3++) {
     for (int64_t i2 = 0; i2 < ne12; i2++) {
-        const block_q8_1 * xq = src1_q8_1.get()
+        const block_q8_1 * xq = src1_q8_1_d
                           + (i3 * ne12 + i2) * x_stride;
         float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
         // Bias is shaped like the single-token dst ([ne0, 1, ne2]): per-channel stride ne01.
