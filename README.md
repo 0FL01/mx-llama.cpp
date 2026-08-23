@@ -1,13 +1,22 @@
 <!-- fork banner -->
-> **mx-llama.cpp** is a fork of llama.cpp focused on multi-GPU optimization, with
-> single-GPU and speculative-decoding work alongside. The optimizations are
-> backend-generic; the kernel-level tuning targets AMD gfx906 simply because that
-> is the multi-GPU hardware it is developed and tested on.
->
-> See **[FEATURES.md](FEATURES.md)** for what it adds and the recommended runtime
-> environment. Prebuilt **AMD / ROCm** (all CDNA + RDNA archs, plus a gfx906-only
-> build) and **NVIDIA / CUDA** images are on Docker Hub:
-> **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**.
+> **mx-llama.cpp** - a fork of llama.cpp for multi-GPU inference. Backend-generic,
+> kernel tuning for AMD gfx906 (MI50).
+> Images: **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**
+
+```
+-sm tensor          [0 1 2 3 4 5 6 7]                  upstream: one group, all layers
+-sm tensor -tps 2   [0 1] -> [2 3] -> [4 5] -> [6 7]   4 groups of 2, pipelined
+```
+
+| | |
+|---|---|
+| **Multi-stage tensor parallelism** | `-tps T` groups the GPUs and pipelines layers across the groups |
+| **DeepSeek-V4-Flash on `-sm tensor`** | upstream keeps deepseek4 on the tensor-split unsupported list |
+| **Speculative decoding** | DSpark and DFlash under tensor parallelism, MTP KV staging |
+| **Custom GPU AllReduce** | peer-write, beats the RCCL ring for generation over PCIe |
+| **Q8_0 weight repack** ([iacopPBK](https://github.com/iacopPBK)) | GPU-side weight layout for gfx906, on by default |
+
+[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b10589`.
 
 ---
 # llama.cpp
