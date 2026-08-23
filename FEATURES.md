@@ -222,8 +222,11 @@ unchanged; greedy generation can differ within floating-point
 reassociation. Model load stages canonical bytes and repacks on the
 device, so `-sm layer` loads at vanilla-loader parity and tensor-parallel
 loads within about 1.4x of it. Narrow batches, such as the multi-token
-steps a speculative verify produces, pick their mat-vec geometry from the
-row length and fuse the MoE up and gate lanes, which puts them at or ahead
-of the canonical path per decode step; perplexity there moves within
-floating-point reassociation (6.2197 to 6.2283 on a 27B dense model at two
-tokens) while wide batches stay exact. Validated on gfx906.
+steps a speculative verify produces, fuse the MoE up and gate lanes and
+size their mat-vec lane group from the tensor shape and the device: a lane
+needs enough accumulation steps to cover its reduction, and the grid that
+results still has to fill the compute units. That puts them at or ahead of
+the canonical path per decode step, worth about 6% on multi-token
+prediction with a 35B MoE. Perplexity is unchanged on MoE and moves within
+floating-point reassociation on dense (6.7010 to 6.6858 on a 27B dense
+model at two tokens), while wide batches stay exact. Validated on gfx906.
