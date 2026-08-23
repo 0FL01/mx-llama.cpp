@@ -938,7 +938,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 // A same-shape reshape still creates the view node that buffer-type
                 // gates need to see. Non-canonical layouts can then reject the weight.
-                op_tensor = ggml_reshape_2d(ctx, w, w->ne[0], w->ne[1]);
+                // Reshape to the weight's OWN extents rather than assuming two
+                // dimensions: a tensor loaded through TENSOR_ALLOW_RESHAPE can arrive
+                // with three, as deepseek4's wo_a does, and a 2D reshape of it fails
+                // the element-count assert before the model can load at all.
+                op_tensor = ggml_reshape_4d(ctx, w, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
             } break;
         case GGML_OP_GET_ROWS:
             {
