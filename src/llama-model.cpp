@@ -899,6 +899,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
+        // Shared expert. It splits on the same axes as the routed FFN, so it needs a
+        // granularity too - without one it fell through to 1 below and a row-parallel
+        // down slice that is not a multiple of the quant block size aborts the meta
+        // backend, which is why a TP width that does not divide it evenly, such as
+        // three devices on a 512-wide shared expert, could not load at all.
+        // It cannot simply borrow the routed FFN's 128: the shared expert is small,
+        // 512 wide is only four granules, so three lanes get 128/128/256 and five or
+        // more lanes get a ZERO slice. Grow only while every lane still holds at
+        // least four granules. That keeps 128 on the wide routed tensors, keeps the
+        // even 2/4/8 splits byte-identical to what they already produce, and falls
+        // back toward the block size where the tensor is too narrow to divide.
+        if (std::regex_match(tensor_name, pattern_ffn_up_shexp) || std::regex_match(tensor_name, pattern_ffn_down_shexp)) {
+            GGML_ASSERT(segments.size() == 1);
+            const int64_t n_lanes_g = (int64_t) std::max<size_t>(tp_width_eff, 1);
+            int64_t g = blck_size;
+            while (g < 128 && segments[0].first / (g * 2) >= 4 * n_lanes_g) {
+                g *= 2;
+            }
+            return {g};
+        }
+
         // FFN
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
