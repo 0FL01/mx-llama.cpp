@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <utility>
 #include <vector>
 
 struct llama_model;
@@ -143,10 +144,9 @@ struct llama_context {
     bool layer_inp_accum_wait(llama_pos p_end);
     bool layer_inp_accum_ready(llama_pos p_end);
 
-    // Set after a tap readback is enqueued, consumed by the next graph_compute so
-    // the tap's writer waits on the device for the reader to retire.
-    ggml_backend_event_t tap_readback_event   = nullptr;
-    ggml_backend_t       tap_readback_backend = nullptr;
+    // Set after tap readbacks are enqueued, consumed by the next graph_compute so
+    // every tap writer waits on its device for the corresponding reader to retire.
+    std::vector<std::pair<ggml_backend_t, ggml_backend_event_t>> tap_readback_waits;
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

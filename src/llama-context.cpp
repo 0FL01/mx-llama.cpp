@@ -2749,8 +2749,11 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
                 }
 
                 if (taps_static) {
-                    tap_readback_event   = ev.events.back().event;
-                    tap_readback_backend = ev.events.back().backend;
+                    tap_readback_waits.clear();
+                    tap_readback_waits.reserve(ev.events.size());
+                    for (const auto & backend_ev : ev.events) {
+                        tap_readback_waits.emplace_back(backend_ev.backend, backend_ev.event);
+                    }
                 }
             }
         }
@@ -3048,15 +3051,14 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    // The layer tap is a single ubatch deep, so this graph's copy into it would
-    // overwrite rows the previous ubatch's D2H may still be reading. Make the
-    // dependency explicit to the device: the tap backend's stream waits for that
-    // readback to retire before this graph's copy runs. Host side is unaffected,
-    // unlike a synchronize, which drains every backend to achieve the same thing.
-    if (tap_readback_event != nullptr && tap_readback_backend != nullptr) {
-        ggml_backend_event_wait(tap_readback_backend, tap_readback_event);
-        tap_readback_event = nullptr;
+    // A persistent layer tap is a single ubatch deep, so this graph's copies into
+    // it would overwrite rows the previous ubatch's D2H may still be reading.
+    // Each tapped pipeline stage owns a separate writer stream and needs its own
+    // dependency; waiting only on the last stage leaves the other taps exposed.
+    for (const auto & wait : tap_readback_waits) {
+        ggml_backend_event_wait(wait.first, wait.second);
     }
+    tap_readback_waits.clear();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
