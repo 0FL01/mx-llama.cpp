@@ -3453,7 +3453,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_try_instantiate(ggml_cuda_graph * graph) {
+    const cudaError_t stat = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+    if (stat == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        graph->instance = nullptr;
+        return false;
+    }
+    CUDA_CHECK(stat);
+    return true;
+}
+
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if defined(GGML_USE_HIP)
@@ -3492,8 +3503,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         GGML_LOG_DEBUG("%s: HIP: kernel set changed, re-instantiating graph exec\n", __func__);
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        return;
+        return ggml_cuda_graph_try_instantiate(graph);
     }
     {
         hipGraphNode_t errorNode;
@@ -3503,9 +3513,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             (void)hipGetLastError();
             CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
             graph->instance = nullptr;
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            return ggml_cuda_graph_try_instantiate(graph);
         }
     }
+    return true;
 #else
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -3526,10 +3537,11 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return ggml_cuda_graph_try_instantiate(graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return true;
 #endif // defined(GGML_USE_HIP)
 }
 #endif // USE_CUDA_GRAPH
@@ -5150,10 +5162,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool graph_ready = true;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            graph_ready = ggml_cuda_graph_try_instantiate(graph);
         } else if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            graph_ready = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        if (!graph_ready) {
+            GGML_LOG_WARN("%s: device %d graph executable did not fit, using direct execution for this graph\n",
+                    __func__, cuda_ctx->device);
+            if (graph->graph != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                graph->graph = nullptr;
+            }
+            graph->disable_due_to_memory = true;
+
+            // Captured kernels did not execute. Drop any activation-cache entries
+            // they prepared before evaluating the graph directly.
+            cuda_ctx->q8_1_cache_reset();
+            ggml_cuda_graph_evaluate_and_capture(
+                    cuda_ctx, cgraph, false, false, graph_key);
+            return;
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
