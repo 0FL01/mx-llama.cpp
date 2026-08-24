@@ -13,6 +13,8 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include "../ggml/src/ggml-backend-sched-impl.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -312,18 +314,6 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
 
-    // Tiny-ubatch multi-GPU pipelining lets the host free-run ahead of lagging
-    // devices and race the sched's split-input copies (observed on ROCm, where
-    // enqueued cross-device event waits do not order reliably). Turn on the
-    // sched's host-drain for such configs before any sched is created. Setting
-    // the variable manually overrides this either way.
-    if (cparams.n_ubatch < 64) {
-#ifdef _WIN32
-        _putenv_s("GGML_SCHED_SYNC_NONGRAPH", "1");
-#else
-        setenv("GGML_SCHED_SYNC_NONGRAPH", "1", 0);
-#endif
-    }
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -656,7 +646,23 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    auto new_sched = [&](bool parallel) {
+        ggml_backend_sched_t result = ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            max_nodes, parallel, cparams.op_offload);
+
+        // Tiny-ubatch multi-GPU pipelining can race split-input reuse on ROCm.
+        // Keep the policy local to this context. An explicit environment value
+        // remains a diagnostic override sampled when the scheduler is created.
+        bool sync_non_graph_inputs = cparams.n_ubatch < 64;
+        if (const char * value = getenv("GGML_SCHED_SYNC_NONGRAPH")) {
+            sync_non_graph_inputs = atoi(value) != 0;
+        }
+        ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
+        return result;
+    };
+
+    sched.reset(new_sched(cparams.pipeline_parallel));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -739,7 +745,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched.reset(new_sched(false));
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
