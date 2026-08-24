@@ -1475,6 +1475,8 @@ struct ggml_backend_cuda_context {
     // Zero keeps the original full-width path until actual memory pressure occurs.
     int64_t mmq_workspace_cols_cap = 0;
     bool mmq_workspace_cols_cap_logged = false;
+    int64_t repack_workspace_cols_cap = 0;
+    bool repack_workspace_cols_cap_logged = false;
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
