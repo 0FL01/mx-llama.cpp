@@ -2321,15 +2321,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // MTP deferred prefill: when an accum buffer is set (unmasked target during
                 // prompt prefill), extract straight into the position-indexed accum buffer
                 // and skip the per-batch embd_nextn copy, which is unused during prefill.
-                // This keeps the whole prompt hidden across decode calls without a per-chunk
-                // synchronize and avoids a second D2H. Assumes a contiguous ubatch (single
-                // sequence, sequential positions), which holds for prefill.
+                // Sequential positions use one D2H; unusual non-contiguous positions are
+                // copied row-by-row so replay indexes the actual positions safely.
                 const bool accum_active = embd_pre_norm_accum && !masked && ubatch.pos;
                 if (accum_active) {
-                    const int64_t p0 = ubatch.pos[0];
-                    if (p0 >= 0 && (size_t) (p0 + n_rows)*n_embd <= embd_pre_norm_accum_size) {
-                        float * dst = embd_pre_norm_accum + (size_t) p0*n_embd;
-                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst, 0, n_rows*n_embd*sizeof(float));
+                    bool positions_valid = true;
+                    bool positions_contiguous = true;
+                    for (int64_t i = 0; i < n_rows; ++i) {
+                        const llama_pos pos = ubatch.pos[i];
+                        positions_valid = positions_valid && pos >= 0 &&
+                            ((size_t) pos + 1) * n_embd <= embd_pre_norm_accum_size;
+                        positions_contiguous = positions_contiguous &&
+                            (i == 0 || pos == ubatch.pos[0] + i);
+                    }
+
+                    if (positions_valid) {
+                        if (positions_contiguous) {
+                            float * dst = embd_pre_norm_accum + (size_t) ubatch.pos[0] * n_embd;
+                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst, 0,
+                                    n_rows * n_embd * sizeof(float));
+                        } else {
+                            const size_t row_bytes = (size_t) n_embd * sizeof(float);
+                            for (int64_t i = 0; i < n_rows; ++i) {
+                                float * dst = embd_pre_norm_accum + (size_t) ubatch.pos[i] * n_embd;
+                                ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst,
+                                        (size_t) i * row_bytes, row_bytes);
+                            }
+                        }
 
                         // The async extract reads t_h_nextn straight from the scheduler's
                         // rotating compute buffer (one slot per copy in the pipeline ring). With
