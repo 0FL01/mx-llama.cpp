@@ -1471,6 +1471,10 @@ struct ggml_backend_cuda_context {
     // Remember a smaller split flash-attention workspace after an allocation failure.
     int fattn_parallel_blocks_cap = 0;
     bool fattn_parallel_blocks_override_logged = false;
+    // Maximum MMQ output columns known to fit its quantized-activation workspace.
+    // Zero keeps the original full-width path until actual memory pressure occurs.
+    int64_t mmq_workspace_cols_cap = 0;
+    bool mmq_workspace_cols_cap_logged = false;
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
