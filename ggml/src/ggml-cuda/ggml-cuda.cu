@@ -1227,9 +1227,14 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         streams[i]     = cuda_ctx->stream();
     }
 
-    ggml_cuda_tp::tp_custom_ar_prepare(
-        &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams,
-        &comm_ctx->ar_plan);
+    if (!ggml_cuda_tp::tp_custom_ar_prepare(
+            &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams,
+            &comm_ctx->ar_plan)) {
+        // Avoid retrying an allocation that already failed under a stable
+        // model/context footprint. The configured regular path remains valid.
+        comm_ctx->use_custom_ar = false;
+        return false;
+    }
 
     // Deferred to launch_rank so it is ordered after that lane's subgraph even
     // when prepare runs ahead of the lanes (fused dispatch).
