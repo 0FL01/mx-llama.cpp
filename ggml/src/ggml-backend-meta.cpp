@@ -3397,7 +3397,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // bytes (then operation count). Decode shapes therefore remain on the
                     // established boundary whenever moving the seam would relay HCA state.
                     const ggml_tensor * first = cgraph->nodes[i_start];
-                    if (backend_ctx->layer_seam_cost && i_start + 1 < i &&
+                    // Transfer bytes are the dominant cost for prompt-sized graphs.
+                    // Decode and speculative-verify graphs are too narrow for that
+                    // metric alone: moving their seam can save a small copy while
+                    // worsening stage balance. Keep their established boundary.
+                    if (backend_ctx->layer_seam_cost && ggml_nrows(first) > 16 && i_start + 1 < i &&
                             std::strncmp(first->name, "l_last-", 7) == 0) {
                         const int candidate = rewind_persistent(i_start + 1);
                         if (candidate < snap_to) {
@@ -3421,9 +3425,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             }
                             if (backend_ctx->dbg_part) {
                                 fprintf(stderr,
-                                        "[meta-seam] uid=%zu stage=%d->%d current=%d bytes=%zu ops=%zu "
+                                        "[meta-seam] uid=%zu rows=%lld stage=%d->%d current=%d bytes=%zu ops=%zu "
                                         "candidate=%d bytes=%zu ops=%zu selected=%d\n",
-                                        (size_t) cgraph->uid, current_stage, n_stage,
+                                        (size_t) cgraph->uid, (long long) ggml_nrows(first), current_stage, n_stage,
                                         current, current_cost.first, current_cost.second,
                                         candidate, candidate_cost.first, candidate_cost.second, snap_to);
                             }
