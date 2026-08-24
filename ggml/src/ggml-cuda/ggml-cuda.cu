@@ -2001,13 +2001,38 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     ggml_cuda_pool_alloc<cuda_t> src0_alloc(ctx.pool());
     ggml_cuda_pool_alloc<cuda_t> src1_alloc(ctx.pool());
 
+    auto alloc_with_cache_recovery = [&](auto & allocation, const size_t n_elements, const char * label) {
+        if (allocation.try_alloc(n_elements) != nullptr) {
+            return;
+        }
+
+        // Cached q8_1 activations are optional and their consuming kernels
+        // precede this operation on the same stream. Release them before a
+        // required BLAS conversion workspace is allowed to abort the graph.
+        if (!ctx.q8_1_cache.empty()) {
+            ctx.q8_1_cache.clear();
+            if (!ctx.q8_1_cache_pressure_logged) {
+                GGML_LOG_WARN("CUDA q8_1 cache[%d]: required BLAS %s workspace did not fit; releasing cached activations\n",
+                              ctx.device, label);
+                ctx.q8_1_cache_pressure_logged = true;
+            }
+            if (allocation.try_alloc(n_elements) != nullptr) {
+                return;
+            }
+        }
+
+        // Preserve the regular fail-fast diagnostic when no optional memory
+        // remains to recover.
+        allocation.alloc(n_elements);
+    };
+
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
-        src0_alloc.alloc(ggml_nelements(src0));
+        alloc_with_cache_recovery(src0_alloc, ggml_nelements(src0), "source-0 conversion");
 
         if (ggml_is_contiguously_allocated(src0)) {
             const auto convert_func = traits::convert(src0->type);
@@ -2032,7 +2057,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
-        src1_alloc.alloc(ggml_nelements(src1));
+        alloc_with_cache_recovery(src1_alloc, ggml_nelements(src1), "source-1 conversion");
 
         if (ggml_is_contiguously_allocated(src1)) {
             const auto convert_func = traits::convert(src1->type);
@@ -2084,7 +2109,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
         } else {
-            dst_ptr = (char *) dst_temp.alloc(ne_dst);
+            alloc_with_cache_recovery(dst_temp, ne_dst, "output conversion");
+            dst_ptr = (char *) dst_temp.get();
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
@@ -2136,8 +2162,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
 
-        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool(), 2*ne23);
-        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool(), 1*ne23);
+        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool());
+        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool());
+        alloc_with_cache_recovery(ptrs_src, 2*ne23, "source pointer");
+        alloc_with_cache_recovery(ptrs_dst, 1*ne23, "destination pointer");
 
         const size_t src_type_size = sizeof(cuda_t);
 
