@@ -1563,6 +1563,7 @@ struct ggml_backend_cuda_context {
     size_t q8_1_cache_hits   = 0;
     size_t q8_1_cache_misses = 0;
     size_t q8_1_cache_peak   = 0; // most entries alive at once, over the run
+    bool q8_1_cache_pressure_logged = false;
     void q8_1_cache_reset() {
         q8_1_cache.clear();
     }
@@ -1771,4 +1772,4 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 char * ggml_cuda_q8_1_cache_acquire(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int variant,
         int64_t ne_padded, int64_t s11, int64_t s12, int64_t s13,
-        size_t nbytes, bool & hit);
+        size_t nbytes, bool & hit, bool * pressure = nullptr);

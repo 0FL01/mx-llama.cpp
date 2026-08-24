@@ -498,6 +498,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
+            if (fallible) {
+                *actual_size = 0;
+                return nullptr;
+            }
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
@@ -507,11 +511,6 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
-        }
-        if (fallible && err == cudaErrorMemoryAllocation) {
-            (void) cudaGetLastError();
-            *actual_size = 0;
-            return nullptr;
         }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
@@ -582,7 +581,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc_impl(size_t size, size_t * actual_size, bool fallible) {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -594,6 +593,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             size_t reserve_size = size - avail;
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
 
+            if (fallible && pool_size + reserve_size > CUDA_POOL_VMM_MAX_SIZE) {
+                *actual_size = 0;
+                return nullptr;
+            }
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
             // allocate more physical memory
@@ -602,7 +605,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            const CUresult create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (fallible && create_result == (CUresult) cudaErrorMemoryAllocation) {
+                *actual_size = 0;
+                return nullptr;
+            }
+            CU_CHECK(create_result);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -683,6 +691,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
 
         return ptr;
+    }
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, false);
+    }
+
+    void * try_alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, true);
     }
 
     void free(void * ptr, size_t size) override {
@@ -2403,8 +2419,11 @@ static bool ggml_cuda_q8_1_cache_enabled() {
 char * ggml_cuda_q8_1_cache_acquire(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int variant,
         const int64_t ne_padded, const int64_t s11, const int64_t s12, const int64_t s13,
-        const size_t nbytes, bool & hit) {
+        const size_t nbytes, bool & hit, bool * pressure) {
     hit = false;
+    if (pressure) {
+        *pressure = false;
+    }
 
     if (!ggml_cuda_q8_1_cache_enabled() || !src1) {
         return nullptr;
@@ -2431,8 +2450,29 @@ char * ggml_cuda_q8_1_cache_acquire(
     }
 
     ggml_backend_cuda_context::q8_1_cache_entry e;
-    e.alloc     = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes);
-    e.buf       = e.alloc->get();
+    e.alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool());
+    e.buf   = e.alloc->try_alloc(nbytes);
+
+    // A second cached activation is optional. Under memory pressure, release the
+    // least-recent entry and retry instead of turning this optimization into a
+    // fail-fast allocation. Reusing the released pool buffer remains ordered on
+    // the same stream, as described above.
+    while (!e.buf && !ctx.q8_1_cache.empty()) {
+        ctx.q8_1_cache.erase(ctx.q8_1_cache.begin());
+        if (!ctx.q8_1_cache_pressure_logged) {
+            GGML_LOG_WARN(GGML_CUDA_NAME " q8_1 cache[%d]: allocation did not fit; "
+                    "evicting a cached activation and retrying\n", ctx.device);
+            ctx.q8_1_cache_pressure_logged = true;
+        }
+        e.buf = e.alloc->try_alloc(nbytes);
+    }
+
+    if (!e.buf) {
+        if (pressure) {
+            *pressure = true;
+        }
+        return nullptr;
+    }
     e.src1      = src1;
     e.data      = src1->data;
     e.ne[0]     = src1->ne[0];
