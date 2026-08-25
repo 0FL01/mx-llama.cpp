@@ -1,4 +1,4 @@
-// Repack buffer type: on upload, supported Q8_0 weights are converted to the
+// Repack buffer type: on upload, supported weights (Q8_0, MXFP4) are converted to the
 // gfx906 two-plane layout; everything else is copied through unchanged. Enabled
 // only on gfx906 (the arch the kernels compile for); which tensors qualify is
 // decided by ggml_cuda_repack_tensor_supported().
@@ -88,7 +88,7 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
     uint8_t * repacked = u.p;
 
     for (int64_t e = 0; e < ne2; e++) {
-        repack_q8_0_host((const block_q8_0 *) (src + e * src_stride),
+        repack_host(tensor->type, src + e * src_stride,
             repacked + e * dst_stride, ne0, ne1);
     }
 
@@ -133,6 +133,32 @@ static __global__ void repack_q8_0_kernel(
     }
 }
 
+// Device-side MXFP4 repack: canonical block_mxfp4 (17 B: e8m0 byte, 16 nibble
+// bytes) to de-aliased nibble rows + a 1-byte e plane. The de-alias gap bytes
+// are never read (the kernels guard with sb < n_sub), matching the Q8_0 kernel.
+static __global__ void repack_mxfp4_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_blocks, const int64_t qs_str,
+        const int64_t qs_len, const int64_t src_stride, const int64_t dst_stride,
+        const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
+
+        uint8_t * d_qs = dst + e * dst_stride + row * qs_str + blk * 16;
+        uint8_t * d_e  = dst + e * dst_stride + qs_len + row * n_blocks + blk;
+
+        const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 17;
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            d_qs[k] = sb[1 + k];
+        }
+        d_e[0] = sb[0];
+    }
+}
+
 struct repack_async_state {
     uint8_t *           scratch  = nullptr;
     size_t              cap      = 0;
@@ -173,7 +199,7 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         const int64_t ne1      = tensor->ne[1];
         const int64_t ne2      = tensor->ne[2];
         const int64_t n_blocks = ne0 / 32;
-        const int64_t qs_str   = repack_qs_stride(ne0);
+        const int64_t qs_str   = repack_qs_row_stride(tensor->type, ne0);
         const size_t  src_str  = total / ne2;
         const size_t  dst_str  = repack_gcn_nbytes(tensor->type, ne0, ne1);
         const int64_t n_out    = ne2 * ne1 * n_blocks;
@@ -182,6 +208,11 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         switch (tensor->type) {
             case GGML_TYPE_Q8_0:
                 repack_q8_0_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                break;
+            case GGML_TYPE_MXFP4:
+                repack_mxfp4_kernel<<<grid, block, 0, stream>>>(
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;

@@ -33,7 +33,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 
     const uint8_t * w;
     if (src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src)) {
-        w = repack_q8_0_view_get_cached(src0, src0->view_src, stream);
+        w = repack_view_get_cached(src0, src0->view_src, stream);
     } else {
         w = (const uint8_t *) src0->data;
     }
@@ -44,6 +44,11 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    // The GEMM consumes ids_src1/ids_dst/expert_bounds, the mat-vec reads ids->data
+    // directly. Both types now have a repack mat-vec, so the helper is multi-token
+    // only again. (History: routing MXFP4 decode through the GEMM without widening
+    // this condition handed repack_tile_off uninitialized pool memory as expert
+    // bounds - if a type is ever GEMM-routed at one token, widen this with it.)
     if (n_tokens > 1) {
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
@@ -60,7 +65,10 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const int64_t s11 = src1->nb[1] / sizeof(float);
 
     // Narrow batch: one mat-vec per assignment in a single launch, instead of a
-    // 32-wide tile per active expert.
+    // 32-wide tile per active expert. Q8_0 only: MXFP4 has a single-token
+    // mat-vec below but no multi-token id1 variant (its sub-block is one uint4
+    // of nibbles, so the Q8_0 kernel's half-block indexing has no equivalent),
+    // and falls through to the GEMM's 32-wide tile at these widths.
     if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS &&
         src0->type == GGML_TYPE_Q8_0) {
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
@@ -94,6 +102,13 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     (uint32_t) ne02, nchannels_y, expert_stride, xs_id, dst_s1,
                     nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
             } break;
+            case GGML_TYPE_MXFP4: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                mul_mat_vec_mxfp4_repacked<64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
             default: GGML_ABORT("unsupported repack type");
         }
         return;
@@ -120,17 +135,26 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const bool use_w32 = n_assign < 2 * BN_ID * ne02;
 
     switch (src0->type) {
-        case GGML_TYPE_Q8_0: {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4: {
+            const bool is_mx = src0->type == GGML_TYPE_MXFP4;
             if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
                 ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
                 ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
                 repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
                 const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
-                mmq_gemm_q8_0_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_MXFP4><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
             } else {
                 const int64_t max_tiles = n_assign / BN_ID + ne02;
                 ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
@@ -138,10 +162,17 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
                 // Loose grid.y bound; the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
                 const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
-                mmq_gemm_q8_0_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_MXFP4><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
             }
         } break;
         default: GGML_ABORT("unsupported repack type");
@@ -180,7 +211,7 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
 
     const uint8_t * w;
     if (src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src)) {
-        w = repack_q8_0_view_get_cached(src0, src0->view_src, stream);
+        w = repack_view_get_cached(src0, src0->view_src, stream);
     } else {
         w = (const uint8_t *) src0->data;
     }
@@ -188,7 +219,7 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const ggml_tensor * gate = fusion->gate;
     const uint8_t * w_gate;
     if (gate->view_src != nullptr && ggml_cuda_repack_tensor_supported(gate->view_src)) {
-        w_gate = repack_q8_0_view_get_cached(gate, gate->view_src, stream);
+        w_gate = repack_view_get_cached(gate, gate->view_src, stream);
     } else {
         w_gate = (const uint8_t *) gate->data;
     }

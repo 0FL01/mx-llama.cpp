@@ -4753,8 +4753,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // the canonical path runs one, which is the whole of its decode
             // deficit - and a speculative verify step is 2 to 4 tokens wide, so
             // fusing only at one token never fired under MTP at all.
+            // Q8_0 only: the fused MMV has no MXFP4 port.
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
+                ggml_cuda_repack_mmv_fusion_supported(src0) &&
+                ggml_cuda_repack_mmv_fusion_supported(gate->src[0]) &&
                 ggml_cuda_repack_mmv_fusion_width_ok(
                     ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -4936,7 +4939,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // path, no gate lane). Dense single-token only; MoE (ids) and prefill
         // (ne[1] > 1) fall through to the repacked GEMM. The same-shape guard
         // above guarantees the bias matches the mm output layout the host expects.
-        if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
+        if (ggml_cuda_repack_mmv_fusion_supported(src0) &&
             ids == nullptr && mm_node->ne[1] == 1) {
             ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, bias_node, &fusion_data);
             fused_mul_mat_vec = true;

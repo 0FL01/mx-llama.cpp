@@ -18,6 +18,9 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
     ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void ggml_cuda_repack_async_release(int device);
 
+// Fused MMV is Q8_0-only (it uses the mat-vec kernel, which has no MXFP4 port).
+bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0);
+
 void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 

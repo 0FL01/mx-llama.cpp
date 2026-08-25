@@ -1,6 +1,6 @@
-# Q8_0 repacked-weight path (AMD GCN)
+# Repacked-weight path (AMD GCN)
 
-Custom Q8_0 matmul frontend for gfx906. Weights are converted at upload into a
+Custom matmul frontend for gfx906 (Q8_0 and MXFP4). Weights are converted at upload into a
 two-plane layout consumed by dp4a-based mat-vec and tiled GEMM kernels. Kernel
 bodies are guarded by `#if defined(GGML_USE_HIP) && defined(__gfx906__)`;
 elsewhere they emit `NO_DEVICE_CODE` stubs.
@@ -49,14 +49,14 @@ Three kernel families, chosen per 2D slice:
 |---|---|---|
 | Mat-vec (single token) | `mul_mat_vec_q8_0_repacked<ROWS,NWAVES,HAS_IDS,LANES>` | `ne11 == 1` (dense) / `n_tokens == 1` (MoE) |
 | Mat-vec (narrow batch) | `mul_mat_vec_q8_0_repacked_nc<ROWS,NWAVES,NCOLS,RPL>` | `2 <= ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS`, dense only |
-| GEMM 64-wide | `mmq_gemm_q8_0_repacked<HAS_IDS,TN_,NRL>` | `ne11 >= 128` (dense) / `n_assign >= 2*BN*n_expert` (MoE) |
-| GEMM 32-wide | `mmq_gemm_q8_0_repacked_w32<HAS_IDS,TN_,NRL>` | `MMQ_RP_Q8_MMV_MAX_TOKENS < ne11 < 128` (dense) / `n_assign < 2*BN*n_expert` (MoE) |
+| GEMM 64-wide | `mmq_gemm_repacked<HAS_IDS,TN_,NRL>` | `ne11 >= 128` (dense) / `n_assign >= 2*BN*n_expert` (MoE) |
+| GEMM 32-wide | `mmq_gemm_repacked_w32<HAS_IDS,TN_,NRL>` | `MMQ_RP_Q8_MMV_MAX_TOKENS < ne11 < 128` (dense) / `n_assign < 2*BN*n_expert` (MoE) |
 
 The narrow mat-vec is dense-only. MoE keeps the tile from two tokens up: its
 token counts are per expert, so a narrow ubatch does not imply a narrow tile.
 
 Both GEMM wrappers forward to one device function
-`mmq_gemm_q8_0_repacked_impl<HAS_IDS, CW, TN_, NRL>`.
+`mmq_gemm_repacked_impl<HAS_IDS, CW, TN_, NRL>`.
 
 **Dense vs MoE.** The kernels are single templates parameterized on `HAS_IDS`;
 only the host orchestration differs. Dense (`mul-mat.cu`) quantizes src1,
@@ -133,8 +133,8 @@ Template signature: `<ROWS, NWAVES, HAS_IDS, LANES, HAS_FUSION>`.
 |---|---|---|
 | `repack.cuh` | Public API (7 functions: buft predicate, buffer-type factory, tensor support, should-fire, dense/MoE/mat-vec-fused dispatch). The only header included outside the folder. | `ggml-cuda.cu` |
 | `repack-common.cuh` | Tuning knobs (`MMQ_RP_Q8_*`), layout math (`repack_qs_stride`, `repack_gcn_nbytes`), X swizzle (`sX_swizzle<CW>`), device structs (`rp_x_sub`, `block_q8_1_mmq_h`, `sXq_row_q8`), input-gather helpers, DPP warp reduce, host helper declarations. | all TUs in folder |
-| `repack-kernels.cuh` | All device kernels: `repack_tile_off`, `mul_mat_vec_q8_0_repacked` (optional `HAS_FUSION` epilogue), `mmq_gemm_q8_0_repacked_impl` + 64/32-wide launch wrappers, `repack_tile_meta`. GCN-guarded, `NO_DEVICE_CODE` elsewhere. | `mul-mat.cu`, `mul-mat-id.cu` |
-| `repack-common.cu` | `ggml_cuda_repack_tensor_supported()`, `ggml_cuda_repack_mul_mat_should_fire()` (also handles views), host repack `repack_q8_0_host()`, persistent per-view cache `repack_q8_0_view_get_cached`. | `mul-mat.cu`, `mul-mat-id.cu`, `buffer.cu`, `ggml-cuda.cu` |
+| `repack-kernels.cuh` | All device kernels: `repack_tile_off`, `mul_mat_vec_q8_0_repacked` (optional `HAS_FUSION` epilogue), `mmq_gemm_repacked_impl` + 64/32-wide launch wrappers, `repack_tile_meta`. GCN-guarded, `NO_DEVICE_CODE` elsewhere. | `mul-mat.cu`, `mul-mat-id.cu` |
+| `repack-common.cu` | `ggml_cuda_repack_tensor_supported()`, `ggml_cuda_repack_mul_mat_should_fire()` (also handles views), host repack `repack_q8_0_host()`, persistent per-view cache `repack_view_get_cached`. | `mul-mat.cu`, `mul-mat-id.cu`, `buffer.cu`, `ggml-cuda.cu` |
 | `mul-mat.cu` | Dense entry `ggml_cuda_mul_mat_repacked()` + per-slice dispatcher, dense fused host `ggml_cuda_mul_mat_vec_repacked_fused()`. | `ggml-cuda.cu` |
 | `mul-mat-id.cu` | MoE entry `ggml_cuda_mul_mat_id_repacked()` (token routing, tile prefix-sum, GEMM dispatch). | `ggml-cuda.cu` |
 | `buffer.cu` | Repack buffer type: `set_tensor` (repacks supported Q8_0, handles full and staged partial writes), `get_alloc_size`, factory `ggml_backend_cuda_repack_buffer_type()`, `ggml_backend_buft_is_cuda_repack()`. `get_tensor` is nullptr. | backend registration |
@@ -206,5 +206,5 @@ numbers land in `compiled_kernel_stats/`.
 - MoE fused GLU covers only the no-bias `{MM_ID, MM_ID, GLU}` shape, and only at
   one token. Bias and scale subgraphs, and every batch wider than one token, use
   the unfused path.
-- Only Q8_0 is supported by the two-plane machinery.
+- Q8_0 and MXFP4 are supported by the layout machinery.
 

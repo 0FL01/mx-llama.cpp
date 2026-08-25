@@ -14,7 +14,8 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         return false;
     }
     switch (t->type) {
-        case GGML_TYPE_Q8_0: {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4: {
             return t->ne[0] % 32 == 0;
         }
         default:             return false;
@@ -45,6 +46,15 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     return src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src);
 }
 
+// The FUSED mat-vec path dispatches to mul_mat_vec_q8_0_repacked, which is Q8_0-only:
+// an MXFP4 sub-block is a single uint4 of nibbles, so that kernel's half-block
+// indexing (2 uint4 per sub-block) has no MXFP4 equivalent. MXFP4 reaches the GEMM
+// for every token count instead, so it must not be offered the fusion.
+bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
+    const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
+    return t->type == GGML_TYPE_Q8_0 && ggml_cuda_repack_mul_mat_should_fire(src0);
+}
+
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane
 // [ne1 x nsp]; padding sub-blocks are left zeroed.
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
@@ -62,6 +72,43 @@ void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne
             memcpy(dst + (size_t) row * qs_str + (size_t) blk * 32, b->qs, 32);
             memcpy(dst + qs_len + (size_t)(row * n_blocks + blk) * 2, &b->d, 2);
         }
+    }
+}
+
+// Host repack of one MXFP4 matrix: nibble rows [ne1 x qs_str, de-aliased like
+// Q8_0's qs rows] then a 1-byte e8m0 plane [ne1 x ne0/32]. The nibbles are
+// copied VERBATIM - the low/high split is undone on the device by
+// rp_mxfp4_expand, so the packed bytes stay a single aligned uint4 load.
+// Padding bytes are left zeroed. NOTE: a zero e8m0 byte decodes to 2^-127, not
+// 0, so device code must never dot padding nibbles against live data - the
+// kernels guard with sb < n_sub, not with the scale.
+void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    const int64_t n_blocks = ne0 / 32;
+    const int64_t qs_str   = repack_qs_row_stride(GGML_TYPE_MXFP4, ne0);
+    const size_t  qs_len   = (size_t) ne1 * qs_str;
+
+    memset(dst, 0, qs_len + (size_t) ne1 * n_blocks);
+
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_mxfp4 * b = &blocks[row * n_blocks + blk];
+            memcpy(dst + (size_t) row * qs_str + (size_t) blk * 16, b->qs, 16);
+            dst[qs_len + (size_t)(row * n_blocks + blk)] = b->e;
+        }
+    }
+}
+
+void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            repack_q8_0_host((const block_q8_0 *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_MXFP4:
+            repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);
+            break;
+        default:
+            GGML_ABORT("unsupported repack type");
     }
 }
 
@@ -90,7 +137,7 @@ static std::mutex s_view_cache_mutex;
 
 // Get or create a persistent device buffer for a re-packed view (source may be a
 // graph-captured stream; src/dst addresses are stable because the entry persists).
-const uint8_t * repack_q8_0_view_get_cached(
+const uint8_t * repack_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base,
         cudaStream_t stream) {
     const int64_t ne0_v = view->ne[0];
@@ -102,8 +149,10 @@ const uint8_t * repack_q8_0_view_get_cached(
     GGML_ASSERT(ne0_v == ne0_b);
     GGML_ASSERT(base->view_src == nullptr);
 
-    const int64_t qs_str  = repack_qs_stride(ne0_v);
-    const int64_t n_sub   = ne0_v / 32;
+    // Per-type strides: MXFP4 rows carry packed nibbles (ne0/2 B) with 1 B
+    // e8m0 scales, Q8_0 rows carry ne0 B with 2 B f16 scales.
+    const int64_t qs_str  = repack_qs_row_stride(base->type, ne0_v);
+    const int64_t sc_row  = repack_scale_row_bytes(base->type, ne0_v);
     const uint8_t * base_ptr = (const uint8_t *) base->data;
     const uint8_t * view_ptr = (const uint8_t *) view->data;
 
@@ -112,7 +161,7 @@ const uint8_t * repack_q8_0_view_get_cached(
 
     // Copy every expert in the view (ne1_v x ne2_v), not just ne1_v rows.
     const size_t qs_size = (size_t) ne1_v * ne2_v * qs_str;
-    const size_t sc_size = (size_t) ne1_v * ne2_v * n_sub * 2;
+    const size_t sc_size = (size_t) ne1_v * ne2_v * sc_row;
     const size_t total   = qs_size + sc_size;
 
     RepackViewCacheKey key{ view->data, ne0_v, ne1_v, ne2_v };
@@ -132,7 +181,7 @@ const uint8_t * repack_q8_0_view_get_cached(
 
     // Scale plane: starts after the FULL base QS plane.
     const uint8_t * src_scales = base_ptr + (size_t) ne1_b * ne2_b * qs_str
-                                       + (size_t) row_start * n_sub * 2;
+                                       + (size_t) row_start * sc_row;
     CUDA_CHECK(cudaMemcpyAsync(d_ptr + qs_size, src_scales, sc_size,
         cudaMemcpyDeviceToDevice, stream));
 

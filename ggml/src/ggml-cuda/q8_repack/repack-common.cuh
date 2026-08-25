@@ -4,6 +4,7 @@
 #include "../common.cuh"
 #include "../mmq.cuh"
 #include "../quantize.cuh"
+#include "../vecdotq.cuh"   // get_int_from_table_16, for the MXFP4 nibble expand
 
 #include <cstddef>
 
@@ -36,14 +37,69 @@ static __host__ __device__ inline T repack_qs_stride(const T ne0) {
     return rs;
 }
 
+// Per-type qs row stride and scale row bytes: Q8_0 rows carry ne0 payload
+// bytes and 2 B f16 scales per sub-block, MXFP4 rows carry packed nibbles
+// (ne0/2 B) and 1 B e8m0 scales per sub-block. Both share the de-alias bump.
+template <typename T>
+static __host__ __device__ inline T repack_qs_row_stride(const ggml_type type, const T ne0) {
+    return repack_qs_stride(type == GGML_TYPE_MXFP4 ? ne0 / 2 : ne0);
+}
+template <typename T>
+static __host__ __device__ inline T repack_scale_row_bytes(const ggml_type type, const T ne0) {
+    return (ne0 / 32) * (type == GGML_TYPE_MXFP4 ? 1 : 2);
+}
+
 static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, const int64_t ne1) {
     GGML_ASSERT(ne0 % 32 == 0);
     switch (type) {
         case GGML_TYPE_Q8_0:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0) + (size_t)(ne0 / 32) * 2);
+        // nibble plane row [ne0/2 B, de-aliased like the Q8_0 qs rows] + 1-byte
+        // e8m0 plane [ne0/32]/row. 17 B/block = canonical size, so the repack
+        // stays VRAM-neutral (a 2-byte scale slot cost +5.9% and OOMed
+        // gpt-oss-120b at 2-GPU full offload). The GEMM's LDS scale array stays
+        // uint16_t; only the GLOBAL load narrows.
+        case GGML_TYPE_MXFP4:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32));
         default:             GGML_ABORT("unsupported repack type");
     }
 }
+
+// Bytes per sub-block in the qs plane, and uint4 loads needed to fetch one.
+static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
+    return type == GGML_TYPE_MXFP4 ? 16 : 32;
+}
+
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+// MXFP4 sub-block: 16 payload bytes coding 32 values as nibbles.
+// get_int_from_table_16 returns v.x for the four LOW nibbles and v.y for the four
+// HIGH nibbles, and stock load_tiles_mxfp4 stores them at k0 and k0 + QI_MXFP4 -
+// i.e. the high nibbles of int32 slot j are values 16+4j..19+4j, NOT 4j+4...
+// So all four v.x concatenate into values 0..15 and all four v.y into 16..31,
+// which is exactly the lo/hi split the Q8_0 path already feeds to dp4a.
+// Swapping these compiles, runs, and produces plausible-looking wrong output.
+static __device__ __forceinline__ void rp_mxfp4_expand(
+        const uint4 nib, uint4 & lo, uint4 & hi) {
+    const int2 v0 = get_int_from_table_16((int) nib.x, kvalues_mxfp4);
+    const int2 v1 = get_int_from_table_16((int) nib.y, kvalues_mxfp4);
+    const int2 v2 = get_int_from_table_16((int) nib.z, kvalues_mxfp4);
+    const int2 v3 = get_int_from_table_16((int) nib.w, kvalues_mxfp4);
+    lo = make_uint4((uint32_t) v0.x, (uint32_t) v1.x, (uint32_t) v2.x, (uint32_t) v3.x);
+    hi = make_uint4((uint32_t) v0.y, (uint32_t) v1.y, (uint32_t) v2.y, (uint32_t) v3.y);
+}
+
+// Stock MMQ folds a 0.5f into the MXFP4 tile scale
+// (x_df = ggml_cuda_e8m0_to_fp32(e)*0.5f). Reproduce it exactly or the result is
+// off by a factor of two per block rather than merely imprecise.
+template <ggml_type WT>
+static __device__ __forceinline__ float rp_scale_from_slot(const uint16_t s) {
+    if constexpr (WT == GGML_TYPE_MXFP4) {
+        return ggml_cuda_e8m0_to_fp32((uint8_t) s) * 0.5f;
+    } else {
+        return __half2float(*reinterpret_cast<const __half *>(&s));
+    }
+}
+#endif
 
 template <int CW>
 static __device__ __forceinline__ int sX_swizzle(int lr) {
@@ -159,8 +215,10 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group(
 }
 
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 
-const uint8_t * repack_q8_0_view_get_cached(
+const uint8_t * repack_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base, cudaStream_t stream);
 
 // Drop cached re-packed views that live inside [base, base+size) - called when the

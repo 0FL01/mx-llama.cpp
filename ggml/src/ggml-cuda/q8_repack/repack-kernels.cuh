@@ -390,8 +390,69 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 #endif
 }
 
-template <bool HAS_IDS, int CW, int TN_, int NRL>
-static __device__ void mmq_gemm_q8_0_repacked_impl(
+// MXFP4 mat-vec on the repacked layout: one uint4 of nibbles per 32-value
+// sub-block, expanded in-register via rp_mxfp4_expand, 1-byte e8m0 scale plane.
+// Simple LANES-strided sub-block loop: both production instantiations of the
+// Q8_0 mat-vec run WPR == 1 (dense <16,16,false,64>, MoE <64,16,true,16>), so
+// this kernel requires WPR == 1 and skips the k-slice machinery. No fusion
+// variant - the fused entry stays Q8_0-only via
+// ggml_cuda_repack_mmv_fusion_supported().
+template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64>
+static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_mxfp4_repacked(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1,
+        const uint32_t nchannels_y, const size_t expert_stride,
+        const uint32_t xs_id, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    constexpr int NWARPS = (NWAVES * 64) / LANES;
+    constexpr int WPR    = NWARPS / ROWS;
+    static_assert(WPR == 1, "mxfp4 mat-vec assumes one lane-group per row");
+
+    if constexpr (HAS_IDS) {
+        const uint32_t a = blockIdx.y;
+        const uint32_t e = (uint32_t) ids_src1[a];
+        wbase += e * expert_stride;
+        xq    += (size_t)(a % nchannels_y) * xs_id;
+        y     += (size_t) a * dst_s1;
+    } else {
+        GGML_UNUSED_VARS(ids_src1, nchannels_y, expert_stride, xs_id, dst_s1);
+    }
+    const uint32_t n_sub  = ne0 >> 5;
+    const uint32_t qs_str = repack_qs_row_stride(GGML_TYPE_MXFP4, ne0);
+
+    const int warp_id = threadIdx.x / LANES;
+    const int lane    = threadIdx.x % LANES;
+    const int row     = blockIdx.x * ROWS + warp_id;
+
+    // Clamped rows read a valid row's data and discard the result at the write.
+    const uint32_t wrow = min((uint32_t) row, ne1 - 1);
+    const uint4   * w_row = reinterpret_cast<const uint4 *>(wbase + (size_t) wrow * qs_str);
+    const uint8_t * d_row = wbase + (size_t) ne1 * qs_str + (size_t) wrow * n_sub;
+
+    float acc = 0.0f;
+    for (uint32_t sb = (uint32_t) lane; sb < n_sub; sb += LANES) {
+        uint4 lo, hi;
+        rp_mxfp4_expand(w_row[sb], lo, hi);
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * x32 = reinterpret_cast<const int *>(xb->qs);
+        int idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
+        idot    += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
+        acc += ggml_cuda_e8m0_to_fp32(d_row[sb]) * 0.5f * dx * (float) idot;
+    }
+    const float a = rp_warp_reduce_sum<LANES>(acc);
+    if (lane == 0 && row < (int) ne1) {
+        y[row] = a;
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, nchannels_y, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL>
+static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
@@ -422,11 +483,15 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
     }
 
     const uint32_t n_sub = ne0 >> 5;
-    const uint32_t qs_str = repack_qs_stride(ne0);
+    const uint32_t qs_str = repack_qs_row_stride(WT, ne0);
     const uint32_t qs_u4  = qs_str >> 4;
-    const uint4    * __restrict__ qsp = reinterpret_cast<const uint4 *>(wbase);
-    const uint16_t * __restrict__ dp  = reinterpret_cast<const uint16_t *>(
-        wbase + (size_t) ne1 * qs_str);
+    // Q8_0 stores 32 payload bytes per sub-block (2 uint4), MXFP4 stores 16
+    // (1 uint4, packed nibbles). Scale plane: 2-byte f16 slots for Q8_0,
+    // 1-byte e8m0 for MXFP4. The LDS scale array stays uint16_t either way -
+    // only the global load width differs.
+    constexpr uint32_t QS_U4 = (WT == GGML_TYPE_MXFP4) ? 1u : 2u;
+    const uint4   * __restrict__ qsp    = reinterpret_cast<const uint4 *>(wbase);
+    const uint8_t * __restrict__ dplane = wbase + (size_t) ne1 * qs_str;
     const block_q8_1_mmq_h * __restrict__ xmmq = reinterpret_cast<const block_q8_1_mmq_h *>(xq);
 
     const block_q8_1_mmq_h * x_group = xmmq;
@@ -488,12 +553,23 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
             const uint32_t sb   = sb0 + lk;
             const uint32_t wrow = row0 + lr;
             if (wrow < ne1 && sb < n_sub) {
-                const size_t q4 = (size_t) wrow * qs_u4 + 2 * (size_t) sb;
-                pw_lo[i] = rp_ldcs_u4(qsp + q4);
-                pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
-                pw_d [i] = dp[(size_t) wrow * n_sub + sb];
+                const size_t q4 = (size_t) wrow * qs_u4 + QS_U4 * (size_t) sb;
+                const size_t di = (size_t) wrow * n_sub + sb;
+                if constexpr (WT == GGML_TYPE_MXFP4) {
+                    rp_mxfp4_expand(rp_ldcs_u4(qsp + q4), pw_lo[i], pw_hi[i]);
+                    pw_d[i] = dplane[di];
+                } else {
+                    pw_lo[i] = rp_ldcs_u4(qsp + q4);
+                    pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
+                    pw_d[i] = reinterpret_cast<const uint16_t *>(dplane)[di];
+                }
             } else {
-                pw_d[i] = 0;
+                // Zero the payload too, not just the scale. Q8_0 tolerates garbage
+                // here because d==0 exactly, but MXFP4's e==0 decodes to 2^-127,
+                // not 0, so uninitialised registers would survive into the sum.
+                pw_lo[i] = make_uint4(0, 0, 0, 0);
+                pw_hi[i] = make_uint4(0, 0, 0, 0);
+                pw_d [i] = 0;
             }
         }
     };
@@ -537,11 +613,17 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
 
             const uint32_t wrow = row0 + lr;
             const uint32_t sbi  = sb0 + lk;
-            const size_t   q4   = (size_t) wrow * qs_u4 + 2 * (size_t) sbi;
+            const size_t   q4   = (size_t) wrow * qs_u4 + QS_U4 * (size_t) sbi;
+            const size_t   di   = (size_t) wrow * n_sub + sbi;
 
-            pw_lo[i] = rp_ldcs_u4(qsp + q4);
-            pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
-            pw_d [i] = dp[(size_t) wrow * n_sub + sbi];
+            if constexpr (WT == GGML_TYPE_MXFP4) {
+                rp_mxfp4_expand(rp_ldcs_u4(qsp + q4), pw_lo[i], pw_hi[i]);
+                pw_d[i] = dplane[di];
+            } else {
+                pw_lo[i] = rp_ldcs_u4(qsp + q4);
+                pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
+                pw_d[i] = reinterpret_cast<const uint16_t *>(dplane)[di];
+            }
         }
     };
 
@@ -636,10 +718,27 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
                         whi = sW_hi[row_base + r + 1][kk];
                     }
 
-                    const float d = __half2float(*reinterpret_cast<const __half *>(&dh[rr]));
+                    const float d = rp_scale_from_slot<WT>(dh[rr]);
 
 #pragma unroll
                     for (int n = 0; n < TN_; n++) {
+                        if constexpr (WT == GGML_TYPE_MXFP4) {
+                            // Stock MXFP4 uses MMQ_DP4A_TXS_Q8_1, i.e. it applies the
+                            // scale per 16-value HALF block, while Q8_0 uses TXS_Q8_0
+                            // and scales per 32. Split the accumulator the same way -
+                            // d*(lo) + d*(hi) instead of d*(lo+hi) - or the result is
+                            // mathematically equal but not bit-identical to stock.
+                            int lo = 0, hi = 0;
+                            lo = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], lo);
+                            lo = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], lo);
+                            lo = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], lo);
+                            lo = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], lo);
+                            hi = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], hi);
+                            hi = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], hi);
+                            hi = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], hi);
+                            hi = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], hi);
+                            acc[r][n] += d * dx[n] * (float) lo + d * dx[n] * (float) hi;
+                        } else {
                         int idot = 0;
                         idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
                         idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
@@ -650,6 +749,7 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
                         idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
                         idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
                         acc[r][n] += d * dx[n] * (float) idot;
+                        }
                     }
                 }
             }
@@ -738,8 +838,8 @@ static __device__ void mmq_gemm_q8_0_repacked_impl(
 }
 
 // Launch wrapper: 64-wide waves, tuned for large batches (ne11 >= 128).
-template <bool HAS_IDS, int TN_, int NRL>
-static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
@@ -748,7 +848,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_q8_0_repacked(
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_q8_0_repacked_impl<HAS_IDS, 64, TN_, NRL>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
@@ -1002,8 +1102,8 @@ static __global__ void mul_mat_vec_q8_0_repacked_id1_fused(
 #endif
 }
 
-template <bool HAS_IDS, int TN_, int NRL>
-static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_q8_0_repacked_w32(
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
@@ -1012,7 +1112,7 @@ static __global__ void __launch_bounds__(32 * NRL, 3) mmq_gemm_q8_0_repacked_w32
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_q8_0_repacked_impl<HAS_IDS, 32, TN_, NRL>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
