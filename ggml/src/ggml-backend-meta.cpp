@@ -230,7 +230,17 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
                              op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I32;
         if (!ok_mm && !ok_mmid) return false;
 
-        if (w->type != GGML_TYPE_Q8_0) return false;
+        // Keep in sync with the types ggml_cuda_repack_tensor_supported admits.
+        // The per-type ne0 alignment and the per-lane axis-0 split check follow
+        // from ggml_blck_size below, so per-lane slices that are not
+        // block-aligned correctly stay canonical.
+        switch (w->type) {
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_MXFP4:
+                break;
+            default:
+                return false;
+        }
         if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
 
         // Buffer-independent repackability: enforced here during buft selection so the
