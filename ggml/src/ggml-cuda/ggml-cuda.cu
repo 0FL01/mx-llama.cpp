@@ -4759,7 +4759,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_repack_mmv_fusion_supported(src0) &&
                 ggml_cuda_repack_mmv_fusion_supported(gate->src[0]) &&
                 ggml_cuda_repack_mmv_fusion_width_ok(
-                    ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr)) {
+                    ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
@@ -4940,6 +4940,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // (ne[1] > 1) fall through to the repacked GEMM. The same-shape guard
         // above guarantees the bias matches the mm output layout the host expects.
         if (ggml_cuda_repack_mmv_fusion_supported(src0) &&
+            ggml_cuda_repack_mmv_fusion_width_ok(mm_node->ne[1], false, src0->type) &&
             ids == nullptr && mm_node->ne[1] == 1) {
             ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, bias_node, &fusion_data);
             fused_mul_mat_vec = true;

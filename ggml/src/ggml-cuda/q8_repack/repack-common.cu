@@ -22,7 +22,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }
 }
 
-bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids) {
+bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids, ggml_type wt) {
     // MoE fuses across the whole narrow range: its grid is one block per
     // assignment, so at these widths launch overhead dominates and folding
     // three launches into one pays. Dense does NOT: its grid already spans
@@ -33,6 +33,7 @@ bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids) {
     // +2.4% at 4 - and a speculative verify step is exactly 3 wide at the
     // default draft depth, so dense fusion loses where it would be used.
     const int64_t max_tokens = has_ids ? MMQ_RP_Q8_MOE_MMV_MAX_TOKENS : 1;
+    GGML_UNUSED(wt);
     return n_tokens >= 1 && n_tokens <= max_tokens;
 }
 
@@ -52,7 +53,8 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
 // for every token count instead, so it must not be offered the fusion.
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
     const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
-    return t->type == GGML_TYPE_Q8_0 && ggml_cuda_repack_mul_mat_should_fire(src0);
+    return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) &&
+           ggml_cuda_repack_mul_mat_should_fire(src0);
 }
 
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane

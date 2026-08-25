@@ -31,7 +31,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 // True when a batch of n_tokens is narrow enough that the repacked path runs
 // the multi-column mat-vec, which is the only shape the fused FFN entry points
 // below can serve. Wider batches fall through to the tiled GEMM.
-bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids);
+bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids, ggml_type wt);
 
 void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,

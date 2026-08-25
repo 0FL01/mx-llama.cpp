@@ -214,6 +214,75 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group(
     return out;
 }
 
+// ---- per-type traits ---------------------------------------------------------
+// Everything the shared kernels need to know about a repacked quant type.
+// Adding a type = one specialization here + one line in RP_FOREACH_TYPE below
+// (plus host/device extract functions until those join the traits too).
+//   geom    - per-tensor constants, built once per kernel launch
+//   load_w  - fetch sub-block (wrow, sb): 32 int8 values as a lo/hi uint4 pair
+//             plus the raw scale slot. THE hot path.
+//   scale   - decode a raw scale slot to float.
+template <ggml_type T> struct rp_traits;
+
+template <> struct rp_traits<GGML_TYPE_Q8_0> {
+    static constexpr bool raw_lds = false;
+    // de-aliased qs rows [ne1 x rs], then an f16 scale plane [ne1 x n_sub].
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   dplane_off;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q8_0, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5), dplane_off((size_t) ne1 * rs) {}
+    };
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        const size_t  q4  = (size_t) wrow * g.rs_u4 + 2 * sb;
+        lo = rp_ldcs_u4(qsp + q4);
+        hi = rp_ldcs_u4(qsp + q4 + 1);
+        d  = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ float scale(const uint16_t s) {
+        return __half2float(*reinterpret_cast<const __half *>(&s));
+    }
+#endif
+};
+
+template <> struct rp_traits<GGML_TYPE_MXFP4> {
+    // de-aliased nibble rows [ne1 x rs], then a 1-byte e8m0 plane [ne1 x n_sub].
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   dplane_off;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_MXFP4, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5), dplane_off((size_t) ne1 * rs) {}
+    };
+    // The GEMM stages RAW nibbles (one uint4 per sub-block) and expands at
+    // consume: half the LDS and half the prefetch registers of the expanded
+    // form, which measured 16-22 spilled VGPRs per lane when staged expanded.
+    static constexpr bool raw_lds = true;
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        rp_mxfp4_expand(rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb), lo, hi);
+        d = wbase[g.dplane_off + (size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d   = wbase[g.dplane_off + (size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ float scale(const uint16_t s) {
+        return ggml_cuda_e8m0_to_fp32((uint8_t) s) * 0.5f;
+    }
+#endif
+};
+
+// One entry per supported repack type - generates the dispatch switches.
+#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);

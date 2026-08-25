@@ -239,5 +239,9 @@ one-byte e8m0 scale plane after them, staying at the canonical 17 bytes per
 block so VRAM use does not grow. Measured against the canonical path:
 prefill +24% on a 35B MoE (one GPU) and +34% on gpt-oss-120b (two GPUs,
 layer split), generation +19% on a 27B dense model, perplexity within
-0.02%. The fused FFN mat-vec and the narrow multi-token MoE mat-vec stay
-Q8_0-only.
+0.02%. Narrow batches and decode share the Q8_0 machinery through
+per-type kernel traits: 2-8 token verify batches take one mat-vec per
+expert assignment instead of the tiled GEMM (+41% at four tokens on the
+35B MoE), decode fuses the up and gate lanes (+6% generation on the 35B
+MoE), and tensor-split placement is admitted (+28% prefill on two GPUs
+with `-sm tensor`).

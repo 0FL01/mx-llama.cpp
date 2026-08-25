@@ -48,7 +48,7 @@ Three kernel families, chosen per 2D slice:
 | Path | Kernel | Trigger |
 |---|---|---|
 | Mat-vec (single token) | `mul_mat_vec_q8_0_repacked<ROWS,NWAVES,HAS_IDS,LANES>` | `ne11 == 1` (dense) / `n_tokens == 1` (MoE) |
-| Mat-vec (narrow batch) | `mul_mat_vec_q8_0_repacked_nc<ROWS,NWAVES,NCOLS,RPL>` | `2 <= ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS`, dense only |
+| Mat-vec (narrow batch) | `mul_mat_vec_repacked_nc<ROWS,NWAVES,NCOLS,RPL>` | `2 <= ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS`, dense only |
 | GEMM 64-wide | `mmq_gemm_repacked<HAS_IDS,TN_,NRL>` | `ne11 >= 128` (dense) / `n_assign >= 2*BN*n_expert` (MoE) |
 | GEMM 32-wide | `mmq_gemm_repacked_w32<HAS_IDS,TN_,NRL>` | `MMQ_RP_Q8_MMV_MAX_TOKENS < ne11 < 128` (dense) / `n_assign < 2*BN*n_expert` (MoE) |
 

@@ -390,36 +390,52 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 #endif
 }
 
-// MXFP4 mat-vec on the repacked layout: one uint4 of nibbles per 32-value
-// sub-block, expanded in-register via rp_mxfp4_expand, 1-byte e8m0 scale plane.
-// Simple LANES-strided sub-block loop: both production instantiations of the
-// Q8_0 mat-vec run WPR == 1 (dense <16,16,false,64>, MoE <64,16,true,16>), so
-// this kernel requires WPR == 1 and skips the k-slice machinery. No fusion
-// variant - the fused entry stays Q8_0-only via
-// ggml_cuda_repack_mmv_fusion_supported().
-template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64>
-static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_mxfp4_repacked(
+// Generic repacked mat-vec: any type with 32-value sub-blocks, fetched through
+// rp_traits<WT>::load_w. Simple LANES-strided sub-block loop: both production
+// instantiations of the Q8_0 mat-vec run WPR == 1 (dense <16,16,false,64>, MoE
+// <64,16,true,16>), so this kernel requires WPR == 1 and skips the k-slice
+// machinery. Q8_0 keeps its tuned bespoke kernel; every other type gets this
+// one for free, including the fused up/gate variant.
+template <ggml_type WT, int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64,
+          bool HAS_FUSION = false>
+static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const int32_t * __restrict__ ids_src1,
         const uint32_t nchannels_y, const size_t expert_stride,
-        const uint32_t xs_id, const uint32_t dst_s1) {
+        const uint32_t xs_id, const uint32_t dst_s1,
+        const uint8_t * __restrict__ wbase_gate = nullptr,
+        const float * __restrict__ x_bias = nullptr,
+        const float * __restrict__ gate_bias = nullptr,
+        const ggml_glu_op glu_op = GGML_GLU_OP_REGLU) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     constexpr int NWARPS = (NWAVES * 64) / LANES;
     constexpr int WPR    = NWARPS / ROWS;
-    static_assert(WPR == 1, "mxfp4 mat-vec assumes one lane-group per row");
+    static_assert(WPR == 1, "generic repack mat-vec assumes one lane-group per row");
 
+    if constexpr (!HAS_FUSION) {
+        GGML_UNUSED_VARS(wbase_gate, x_bias, gate_bias, glu_op);
+    }
+    [[maybe_unused]] const bool use_gate = HAS_FUSION && wbase_gate != nullptr;
+
+    [[maybe_unused]] uint32_t expert = 0;
     if constexpr (HAS_IDS) {
         const uint32_t a = blockIdx.y;
         const uint32_t e = (uint32_t) ids_src1[a];
+        expert = e;
         wbase += e * expert_stride;
+        if constexpr (HAS_FUSION) {
+            if (use_gate) {
+                wbase_gate += e * expert_stride;
+            }
+        }
         xq    += (size_t)(a % nchannels_y) * xs_id;
         y     += (size_t) a * dst_s1;
     } else {
         GGML_UNUSED_VARS(ids_src1, nchannels_y, expert_stride, xs_id, dst_s1);
     }
-    const uint32_t n_sub  = ne0 >> 5;
-    const uint32_t qs_str = repack_qs_row_stride(GGML_TYPE_MXFP4, ne0);
+    const uint32_t n_sub = ne0 >> 5;
+    const typename rp_traits<WT>::geom wg(ne0, ne1);
 
     const int warp_id = threadIdx.x / LANES;
     const int lane    = threadIdx.x % LANES;
@@ -427,26 +443,50 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_mxfp4_repacked
 
     // Clamped rows read a valid row's data and discard the result at the write.
     const uint32_t wrow = min((uint32_t) row, ne1 - 1);
-    const uint4   * w_row = reinterpret_cast<const uint4 *>(wbase + (size_t) wrow * qs_str);
-    const uint8_t * d_row = wbase + (size_t) ne1 * qs_str + (size_t) wrow * n_sub;
 
     float acc = 0.0f;
+    [[maybe_unused]] float acc_gate = 0.0f;
     for (uint32_t sb = (uint32_t) lane; sb < n_sub; sb += LANES) {
         uint4 lo, hi;
-        rp_mxfp4_expand(w_row[sb], lo, hi);
+        uint16_t ds;
+        rp_traits<WT>::load_w(wbase, wg, wrow, sb, lo, hi, ds);
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
         const int * x32 = reinterpret_cast<const int *>(xb->qs);
         int idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
         idot    += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
-        acc += ggml_cuda_e8m0_to_fp32(d_row[sb]) * 0.5f * dx * (float) idot;
+        acc += rp_traits<WT>::scale(ds) * dx * (float) idot;
+        if constexpr (HAS_FUSION) {
+            if (use_gate) {
+                uint4 glo, ghi;
+                uint16_t gds;
+                rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, glo, ghi, gds);
+                int gdot = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
+                gdot    += mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
+                acc_gate += rp_traits<WT>::scale(gds) * dx * (float) gdot;
+            }
+        }
     }
     const float a = rp_warp_reduce_sum<LANES>(acc);
+    [[maybe_unused]] float g = 0.0f;
+    if constexpr (HAS_FUSION) {
+        g = rp_warp_reduce_sum<LANES>(acc_gate);
+    }
     if (lane == 0 && row < (int) ne1) {
-        y[row] = a;
+        float out = a;
+        if constexpr (HAS_FUSION) {
+            uint32_t bias_row = (uint32_t) row;
+            if constexpr (HAS_IDS) {
+                bias_row = expert * ne1 + (uint32_t) row;
+            }
+            out = rp_mmv_fusion_epilogue(a, g, x_bias, gate_bias,
+                bias_row, glu_op, use_gate);
+        }
+        y[row] = out;
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, nchannels_y, expert_stride, xs_id, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, nchannels_y, expert_stride,
+                     xs_id, dst_s1, wbase_gate, x_bias, gate_bias, glu_op);
     NO_DEVICE_CODE;
 #endif
 }
@@ -483,19 +523,20 @@ static __device__ void mmq_gemm_repacked_impl(
     }
 
     const uint32_t n_sub = ne0 >> 5;
-    const uint32_t qs_str = repack_qs_row_stride(WT, ne0);
-    const uint32_t qs_u4  = qs_str >> 4;
-    // Q8_0 stores 32 payload bytes per sub-block (2 uint4), MXFP4 stores 16
-    // (1 uint4, packed nibbles). Scale plane: 2-byte f16 slots for Q8_0,
-    // 1-byte e8m0 for MXFP4. The LDS scale array stays uint16_t either way -
-    // only the global load width differs.
-    constexpr uint32_t QS_U4 = (WT == GGML_TYPE_MXFP4) ? 1u : 2u;
-    const uint4   * __restrict__ qsp    = reinterpret_cast<const uint4 *>(wbase);
-    const uint8_t * __restrict__ dplane = wbase + (size_t) ne1 * qs_str;
+    // All layout knowledge lives in rp_traits<WT>: geometry constants built
+    // once, sub-block fetches through load_w. The LDS scale array stays
+    // uint16_t for every type - traits::scale() decodes the raw slot.
+    const typename rp_traits<WT>::geom wg(ne0, ne1);
     const block_q8_1_mmq_h * __restrict__ xmmq = reinterpret_cast<const block_q8_1_mmq_h *>(xq);
 
     const block_q8_1_mmq_h * x_group = xmmq;
 
+    // Raw-register types (MXFP4) prefetch one uint4 of packed nibbles per
+    // sub-block - half the live registers of the expanded pair, which spilled
+    // 16-22 VGPRs per lane - and expand once per element at the LDS store.
+    // LDS stays expanded: expanding at consume instead multiplied the expand
+    // by the row*column reuse and measured -40% prefill.
+    constexpr bool RAW_REG = rp_traits<WT>::raw_lds;
     __shared__ uint4    sW_lo[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
     __shared__ uint4    sW_hi[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
     __shared__ uint16_t sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
@@ -553,15 +594,10 @@ static __device__ void mmq_gemm_repacked_impl(
             const uint32_t sb   = sb0 + lk;
             const uint32_t wrow = row0 + lr;
             if (wrow < ne1 && sb < n_sub) {
-                const size_t q4 = (size_t) wrow * qs_u4 + QS_U4 * (size_t) sb;
-                const size_t di = (size_t) wrow * n_sub + sb;
-                if constexpr (WT == GGML_TYPE_MXFP4) {
-                    rp_mxfp4_expand(rp_ldcs_u4(qsp + q4), pw_lo[i], pw_hi[i]);
-                    pw_d[i] = dplane[di];
+                if constexpr (RAW_REG) {
+                    rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
                 } else {
-                    pw_lo[i] = rp_ldcs_u4(qsp + q4);
-                    pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
-                    pw_d[i] = reinterpret_cast<const uint16_t *>(dplane)[di];
+                    rp_traits<WT>::load_w(wbase, wg, wrow, sb, pw_lo[i], pw_hi[i], pw_d[i]);
                 }
             } else {
                 // Zero the payload too, not just the scale. Q8_0 tolerates garbage
@@ -612,17 +648,11 @@ static __device__ void mmq_gemm_repacked_impl(
             const int lk = e % MMQ_RP_Q8_BK;
 
             const uint32_t wrow = row0 + lr;
-            const uint32_t sbi  = sb0 + lk;
-            const size_t   q4   = (size_t) wrow * qs_u4 + QS_U4 * (size_t) sbi;
-            const size_t   di   = (size_t) wrow * n_sub + sbi;
-
-            if constexpr (WT == GGML_TYPE_MXFP4) {
-                rp_mxfp4_expand(rp_ldcs_u4(qsp + q4), pw_lo[i], pw_hi[i]);
-                pw_d[i] = dplane[di];
+            const uint32_t sb   = sb0 + lk;
+            if constexpr (RAW_REG) {
+                rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
             } else {
-                pw_lo[i] = rp_ldcs_u4(qsp + q4);
-                pw_hi[i] = rp_ldcs_u4(qsp + q4 + 1);
-                pw_d[i] = reinterpret_cast<const uint16_t *>(dplane)[di];
+                rp_traits<WT>::load_w(wbase, wg, wrow, sb, pw_lo[i], pw_hi[i], pw_d[i]);
             }
         }
     };
@@ -657,8 +687,15 @@ static __device__ void mmq_gemm_repacked_impl(
             }
             const int lr = e / MMQ_RP_Q8_BK;
             const int lk = e % MMQ_RP_Q8_BK;
-            sW_lo[lr][lk] = pw_lo[i];
-            sW_hi[lr][lk] = pw_hi[i];
+            if constexpr (RAW_REG) {
+                uint4 lo, hi;
+                rp_mxfp4_expand(pw_lo[i], lo, hi);
+                sW_lo[lr][lk] = lo;
+                sW_hi[lr][lk] = hi;
+            } else {
+                sW_lo[lr][lk] = pw_lo[i];
+                sW_hi[lr][lk] = pw_hi[i];
+            }
             sWdh [lk][lr] = pw_d[i];
         }
 #pragma unroll
@@ -718,7 +755,7 @@ static __device__ void mmq_gemm_repacked_impl(
                         whi = sW_hi[row_base + r + 1][kk];
                     }
 
-                    const float d = rp_scale_from_slot<WT>(dh[rr]);
+                    const float d = rp_traits<WT>::scale(dh[rr]);
 
 #pragma unroll
                     for (int n = 0; n < TN_; n++) {
@@ -866,8 +903,8 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
 // traffic the same way, on the repacked layout. Dense only: the single-token
 // path and the MoE ids path keep their existing kernels.
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false,
-          int LANES = 64>
-static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
+          int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys,
@@ -890,23 +927,22 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
     const int row     = blockIdx.x * ROWS + warp_id * RPL;
 
     const uint32_t n_blocks = ne0 >> 5;
-    const uint32_t qs_str   = repack_qs_stride(ne0);
+    const typename rp_traits<WT>::geom wg(ne0, ne1);
 
     // RPL rows per lane: the activation block is loaded once into registers and
     // reused against every row the lane owns, so the activation side stops
     // being re-read per row. This is what the canonical mat-vec does with its
     // register blocking, and at NCOLS=4 the activations are otherwise 4x the
     // weight bytes per step.
-    const uint4    * w_rows[RPL];
-    const uint16_t * d_rows[RPL];
-    uint16_t         rmasks[RPL];
+    uint32_t wrows [RPL];
+    uint16_t rmasks[RPL];
 #pragma unroll
     for (int r = 0; r < RPL; ++r) {
-        const int      rr   = row + r;
-        const uint32_t wrow = min((uint32_t) rr, ne1 - 1);
-        w_rows[r] = reinterpret_cast<const uint4 *>(wbase + (size_t) wrow * qs_str);
-        d_rows[r] = reinterpret_cast<const uint16_t *>(
-            wbase + (size_t) ne1 * qs_str) + (size_t) wrow * n_blocks;
+        const int rr = row + r;
+        wrows [r] = min((uint32_t) rr, ne1 - 1);
+        // Masking the raw scale slot zeroes dead-row terms for f16; for e8m0 a
+        // zero slot decodes to a tiny nonzero, which is finite and discarded at
+        // the guarded write below either way.
         rmasks[r] = (rr < (int) ne1) ? (uint16_t) 0xffffu : (uint16_t) 0x0000u;
     }
 
@@ -916,17 +952,6 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
     // the canonical path runs one.
     constexpr int GR = HAS_FUSION ? RPL   : 1;
     constexpr int GC = HAS_FUSION ? NCOLS : 1;
-    [[maybe_unused]] const uint4    * wg_rows[GR];
-    [[maybe_unused]] const uint16_t * dg_rows[GR];
-    if constexpr (HAS_FUSION) {
-#pragma unroll
-        for (int r = 0; r < RPL; ++r) {
-            const uint32_t wrow = min((uint32_t)(row + r), ne1 - 1);
-            wg_rows[r] = reinterpret_cast<const uint4 *>(wbase_gate + (size_t) wrow * qs_str);
-            dg_rows[r] = reinterpret_cast<const uint16_t *>(
-                wbase_gate + (size_t) ne1 * qs_str) + (size_t) wrow * n_blocks;
-        }
-    }
 
     float acc[RPL][NCOLS] = {};
     [[maybe_unused]] float accg[GR][GC] = {};
@@ -943,20 +968,18 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
         float dw[RPL];
 #pragma unroll
         for (int r = 0; r < RPL; ++r) {
-            wv0[r] = w_rows[r][sb * 2u];
-            wv1[r] = w_rows[r][sb * 2u + 1u];
-            const uint16_t db = d_rows[r][sb] & rmasks[r];
-            dw[r] = __half2float(*reinterpret_cast<const __half *>(&db));
+            uint16_t db;
+            rp_traits<WT>::load_w(wbase, wg, wrows[r], sb, wv0[r], wv1[r], db);
+            dw[r] = rp_traits<WT>::scale(db & rmasks[r]);
         }
         [[maybe_unused]] uint4 gv0[GR], gv1[GR];
         [[maybe_unused]] float dg[GR];
         if constexpr (HAS_FUSION) {
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
-                gv0[r] = wg_rows[r][sb * 2u];
-                gv1[r] = wg_rows[r][sb * 2u + 1u];
-                const uint16_t gb = dg_rows[r][sb] & rmasks[r];
-                dg[r] = __half2float(*reinterpret_cast<const __half *>(&gb));
+                uint16_t gb;
+                rp_traits<WT>::load_w(wbase_gate, wg, wrows[r], sb, gv0[r], gv1[r], gb);
+                dg[r] = rp_traits<WT>::scale(gb & rmasks[r]);
             }
         }
 #pragma unroll
@@ -1018,12 +1041,12 @@ static __device__ __forceinline__ void mul_mat_vec_q8_0_repacked_nc_impl(
 #endif
 }
 
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64>
-static __global__ void mul_mat_vec_q8_0_repacked_nc(
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void mul_mat_vec_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
-    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES>(
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT>(
         wbase, xq, y, ne0, ne1, xs, ys, nullptr, nullptr, nullptr,
         GGML_GLU_OP_REGLU, 0);
 }
@@ -1051,8 +1074,8 @@ static __device__ __forceinline__ uint32_t expert_bounds_search(
     return lo;
 }
 
-template <int ROWS, int NWAVES, int RPL = 1>
-static __global__ void mul_mat_vec_q8_0_repacked_id1(
+template <int ROWS, int NWAVES, int RPL = 1, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void mul_mat_vec_repacked_id1(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
@@ -1061,7 +1084,7 @@ static __global__ void mul_mat_vec_q8_0_repacked_id1(
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const uint32_t a = blockIdx.y;
     const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
-    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, 1, RPL, false>(
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, 1, RPL, false, 64, WT>(
         wbase + (size_t) e * expert_stride,
         xq + (size_t) ids_src1[a] * xs,
         y  + (size_t) ids_dst[a]  * ys,
@@ -1075,8 +1098,8 @@ static __global__ void mul_mat_vec_q8_0_repacked_id1(
 
 // Fused MoE narrow batch: one assignment per block, up and gate in one pass.
 // The ADD_ID bias is [ne1, n_expert], so the row index carries the expert.
-template <int ROWS, int NWAVES, int RPL = 1>
-static __global__ void mul_mat_vec_q8_0_repacked_id1_fused(
+template <int ROWS, int NWAVES, int RPL = 1, ggml_type WT = GGML_TYPE_Q8_0>
+static __global__ void mul_mat_vec_repacked_id1_fused(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
@@ -1087,7 +1110,7 @@ static __global__ void mul_mat_vec_q8_0_repacked_id1_fused(
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const uint32_t a = blockIdx.y;
     const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
-    mul_mat_vec_q8_0_repacked_nc_impl<ROWS, NWAVES, 1, RPL, true>(
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, 1, RPL, true, 64, WT>(
         wbase + (size_t) e * expert_stride,
         xq + (size_t) ids_src1[a] * xs,
         y  + (size_t) ids_dst[a]  * ys,

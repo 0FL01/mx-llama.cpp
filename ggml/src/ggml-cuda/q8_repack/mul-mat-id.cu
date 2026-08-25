@@ -65,12 +65,9 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const int64_t s11 = src1->nb[1] / sizeof(float);
 
     // Narrow batch: one mat-vec per assignment in a single launch, instead of a
-    // 32-wide tile per active expert. Q8_0 only: MXFP4 has a single-token
-    // mat-vec below but no multi-token id1 variant (its sub-block is one uint4
-    // of nibbles, so the Q8_0 kernel's half-block indexing has no equivalent),
-    // and falls through to the GEMM's 32-wide tile at these widths.
-    if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS &&
-        src0->type == GGML_TYPE_Q8_0) {
+    // 32-wide tile per active expert. Weight loads go through rp_traits, so
+    // every repacked type takes this path.
+    if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS) {
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
         block_q8_1 * src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
             ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
@@ -79,10 +76,21 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         // Four rows per block, two waves. Five geometries were measured at
         // the verify widths and all landed within five percent; this was best.
         const dim3 grid((ne01 + 3) / 4, (unsigned) n_assign, 1);
-        mul_mat_vec_q8_0_repacked_id1<4, 2, 2><<<grid, 128, 0, stream>>>(
-            w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-            ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-            expert_stride, (uint32_t) x_stride, dst_s1);
+        switch (src0->type) {
+            case GGML_TYPE_Q8_0:
+                mul_mat_vec_repacked_id1<4, 2, 2><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
+            case GGML_TYPE_MXFP4:
+                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_MXFP4><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
+            default: GGML_ABORT("unsupported repack type");
+        }
         return;
     }
 
@@ -96,6 +104,14 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         switch (src0->type) {
             case GGML_TYPE_Q8_0: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                static const bool generic_mmv = getenv("GGML_RP_GENERIC_MMV") != nullptr;
+                if (generic_mmv) {
+                    mul_mat_vec_rp<GGML_TYPE_Q8_0, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        (const int32_t *) ids->data, nchannels_y, expert_stride,
+                        xs_id, dst_s1);
+                    break;
+                }
                 mul_mat_vec_q8_0_repacked<64, 16, true, 16><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     (const int32_t *) ids->data, nullptr, nullptr,
@@ -104,7 +120,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             } break;
             case GGML_TYPE_MXFP4: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
-                mul_mat_vec_mxfp4_repacked<64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                mul_mat_vec_rp<GGML_TYPE_MXFP4, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     (const int32_t *) ids->data, nchannels_y, expert_stride,
                     xs_id, dst_s1);
@@ -194,9 +210,10 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(dst->nb[1]  == (size_t) dst->ne[0] * sizeof(float));
     GGML_ASSERT(dst->ne[3] == 1);
     // Narrow batches take the per-assignment mat-vec; wider ones never reach here.
-    GGML_ASSERT(ggml_cuda_repack_mmv_fusion_width_ok(ids->ne[1], true));
+    GGML_ASSERT(ggml_cuda_repack_mmv_fusion_width_ok(ids->ne[1], true, src0->type));
     GGML_ASSERT(fusion != nullptr && fusion->gate != nullptr);
-    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && fusion->gate->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(fusion->gate->type == src0->type &&
+                (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_MXFP4));
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -263,15 +280,34 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         const dim3 grid_nc((ne01 + 3) / 4, (unsigned) n_assign, 1);
         // One row per lane, four waves. Two rows per lane costs a spill and
         // drops occupancy from 6 to 4 once the gate matrix shares the loop.
-        mul_mat_vec_q8_0_repacked_id1_fused<4, 4, 1><<<grid_nc, 256, 0, stream>>>(
-            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
-            ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-            expert_stride, (uint32_t) x_stride, dst_s1,
-            w_gate, x_bias, gate_bias, fusion->glu_op);
+        switch (src0->type) {
+            case GGML_TYPE_Q8_0:
+                mul_mat_vec_repacked_id1_fused<4, 4, 1><<<grid_nc, 256, 0, stream>>>(
+                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1,
+                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
+            case GGML_TYPE_MXFP4:
+                mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_MXFP4><<<grid_nc, 256, 0, stream>>>(
+                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1,
+                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
+            default: GGML_ABORT("unsupported repack type");
+        }
         return;
     }
 
     const dim3 grid((ne01 + 7) / 8, (unsigned) n_assign, 1);
+    if (src0->type == GGML_TYPE_MXFP4) {
+        mul_mat_vec_rp<GGML_TYPE_MXFP4, 8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
+            w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
+            (const int32_t *) ids->data, (uint32_t) src1->ne[1], expert_stride,
+            (uint32_t) x_stride, dst_s1, w_gate, x_bias, gate_bias, fusion->glu_op);
+        return;
+    }
     mul_mat_vec_q8_0_repacked<8, 4, true, 32, true><<<grid, 256, 0, stream>>>(
         w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
         (const int32_t *) ids->data, nullptr, nullptr,
