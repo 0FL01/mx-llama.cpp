@@ -2484,6 +2484,8 @@ struct ggml_backend_meta_context {
             ggml_backend_get_device(simple_backends[0]));
         ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t)
             ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_init");
+        auto comm_set_pipeline_stages = (void (*)(void *, size_t))
+            ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_comm_set_pipeline_stages");
 
         comm_ctxs.assign(n_stages, nullptr);
         const char * env_no_comm = getenv("GGML_META_NO_COMM");
@@ -2491,6 +2493,9 @@ struct ggml_backend_meta_context {
         if (tps > 1 && !no_comm && comm_init != nullptr) {
             for (size_t s = 0; s < n_stages; s++) {
                 comm_ctxs[s] = comm_init(simple_backends.data() + s * tps, tps);
+                if (comm_ctxs[s] != nullptr && comm_set_pipeline_stages != nullptr) {
+                    comm_set_pipeline_stages(comm_ctxs[s], n_stages);
+                }
             }
         }
         // Pull the AR func pointer once if any stage has a comm_ctx.

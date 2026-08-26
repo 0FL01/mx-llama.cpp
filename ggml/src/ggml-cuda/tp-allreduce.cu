@@ -797,10 +797,25 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     // Twoshot needs slice-aligned + float4-aligned data: n_elements % (4*nranks) == 0.
     const bool twoshot_eligible =
         s_broadcast && (n_elements % (int64_t)(4 * nranks) == 0);
-    const int64_t twoshot_min_ne = 262144;               // ~1 MB F32 crossover
+    const int64_t twoshot_legacy_min_ne = 262144;        // ~1 MB F32 crossover
+    // Decode A/B on gfx906 selects two-shot for ranks where its reduced peer
+    // traffic pays for the second phase. Four-rank communicators cross over
+    // only when they are pipeline stages; standalone TP4 remains broadcast.
+    const bool auto_small_twoshot =
+        nranks == 5 || nranks == 8 || nranks == 10 ||
+        (nranks == 4 && ctx->prefer_small_twoshot);
+    const int64_t twoshot_min_ne = auto_small_twoshot ? 1 : twoshot_legacy_min_ne;
     const bool s_twoshot =
         twoshot_eligible &&
         (s_twoshot_env == 1 || (s_twoshot_env == -1 && n_elements >= twoshot_min_ne));
+    if (s_twoshot && s_twoshot_env == -1 && n_elements < twoshot_legacy_min_ne) {
+        if (!ctx->logged_small_twoshot) {
+            ctx->logged_small_twoshot = true;
+            fprintf(stderr,
+                    "TP custom AllReduce: auto-selected two-shot for %d-rank decode-sized tensors\n",
+                    nranks);
+        }
+    }
 
     const size_t bytes_f32 = (size_t) n_elements * sizeof(float);
     // Broadcast path: F32 staging, N slots per rank (one inbox per peer + unused self slot).

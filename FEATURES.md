@@ -75,8 +75,11 @@ AllReduce for the tensor-parallel reduction (in addition to upstream's
 `allreduce.cu`). F32 on the wire and faster than the RCCL / NCCL ring for token
 generation over PCIe. Enable with `GGML_ENABLE_CUSTOM_AR=1`; the fast peer-write
 path needs fine-grain PCIe coherence (`HSA_FORCE_FINE_GRAIN_PCIE=1` on any AMD
-over PCIe, a no-op on hardware-coherent GPUs and ignored on NVIDIA). Validated
-on gfx906.
+over PCIe, a no-op on hardware-coherent GPUs and ignored on NVIDIA). Decode-size
+collectives automatically use two-shot for TP5, TP8, TP10, and TP4 pipeline
+stages; standalone TP4 stays on broadcast. Large prompt collectives keep the
+RCCL / NCCL size gate. `GGML_TP_AR_TWOSHOT=0` forces broadcast and `=1` forces
+two-shot for diagnostics. Validated on gfx906.
 
 ## MTP speculative-decode optimizations
 

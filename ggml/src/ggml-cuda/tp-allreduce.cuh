@@ -127,6 +127,12 @@ struct CustomARContext {
     //  - Otherwise: false → runtime falls back to one-shot path
     bool broadcast_ok = false;
 
+    // Multi-stage TP4 benefits from two-shot at decode sizes while standalone
+    // TP4 does not. The meta backend supplies this private topology hint after
+    // creating each per-stage communicator.
+    bool prefer_small_twoshot = false;
+    bool logged_small_twoshot = false;
+
     // Physical CUDA/HIP device id for each rank. The single-stage TP case has
     // dev_ids[r] == r, but multi-stage TP (vLLM-style TP x PP) gives each stage
     // a non-contiguous slice of the device set, so dev_ids[r] != r in general.

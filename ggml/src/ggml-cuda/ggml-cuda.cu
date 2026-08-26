@@ -1472,6 +1472,12 @@ static void ggml_backend_cuda_comm_set_staging_depth(void * comm_ctx_v, size_t d
         ? (size_t) GGML_SCHED_MAX_COPIES : depth;
 }
 
+static void ggml_backend_cuda_comm_set_pipeline_stages(void * comm_ctx_v, size_t n_stages) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(comm_ctx != nullptr);
+    comm_ctx->custom_ar.prefer_small_twoshot = n_stages > 1;
+}
+
 static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
 }
@@ -6681,6 +6687,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_token_graph_free") == 0) {
         return (void *)ggml_backend_cuda_token_graph_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_set_pipeline_stages") == 0) {
+        return (void *) ggml_backend_cuda_comm_set_pipeline_stages;
     }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_set_staging_depth") == 0) {
