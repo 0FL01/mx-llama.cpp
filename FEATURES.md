@@ -116,8 +116,8 @@ concurrent lane dispatch above. Validated on gfx906.
 
 ## DeepSeek-V4-Flash tensor parallelism
 
-Upstream keeps the deepseek4 architecture on the tensor-split unsupported list,
-so `-sm tensor` refuses to load it. The fork implements the split: the MLA heads
+Upstream added its own deepseek4 tensor split in b10604, with the same head-split
+shape this fork has carried since b10240. The fork keeps its routing: the MLA heads
 divide across the tensor-parallel group with the attention-side state mirrored
 per lane, the lightning-indexer selection runs on the GPU at any context length
 (above 16384 columns it previously fell back to the CPU, which corrupted output
@@ -125,6 +125,14 @@ past 65k context), and the indexer top-k needs no cross-lane broadcast because
 the fused scores are AllReduce outputs and already bit-identical on every lane.
 Byte-deterministic over a 100k-token greedy run, perplexity consistent with
 `-sm layer` within 0.3%. Works with multi-stage `-tps`. Validated on gfx906.
+
+deepseek4 also rebuilt its compressed-state and rollback plans on every ubatch, so
+the graph changed shape each prefill chunk and the allocation was re-planned every
+time. Fixed-width restore and snapshot entries per layout stream make the topology
+constant and the allocation is planned once, which is worth far more than it
+sounds on long prompts: 8x MI50 `-sm layer` with a 23k prompt, 182 to 759 t/s, and
+`-tps 4` generation 23.9 to 26.8 t/s. Three identical requests return identical
+output and identical draft acceptance.
 
 ## Shared-expert tensor-parallel split
 

@@ -1056,6 +1056,16 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     GGML_ASSERT(w->buffer == nullptr);
     w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
     bool op_supported = ggml_backend_dev_supports_op(dev, op_tensor);
+    if (op_supported && op == GGML_OP_RESHAPE) {
+        // A reshape is a free view on every backend and the CPU device answers true
+        // for it unconditionally, so on its own it admits ANY buffer type, including
+        // a CPU extra buffer type that cannot hold the weight: F32 attn_output_a
+        // landed in CPU_REPACK with no repack traits and crashed set_tensor. The
+        // reshape probe only exists so that a layout-bound buffer type can reject
+        // the view. The weight is still consumed by a matmul, so that must pass too.
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
+        op_supported = ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx, w, b));
+    }
     ggml_backend_buffer_free(w->buffer);
     w->buffer = nullptr;
 

@@ -1060,8 +1060,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
-        // DEEPSEEK4 is deliberately absent: the fork runs it under -sm tensor via
-        // llm_arch_sm_tensor_replicates_attention (design A). Do not re-add it.
+        // DEEPSEEK4 is deliberately absent: it runs under -sm tensor (upstream since
+        // b10604, the fork via llm_arch_sm_tensor_replicates_attention). Do not re-add it.
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_BITNET:
