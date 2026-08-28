@@ -9710,7 +9710,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     for (int i = 0; i < 20; ++i) {
-        for (int k : {1, 2, 3, 7, 15, 32, 40, 100, 500, 1023, 9999}) {
+        for (int k : {1, 2, 3, 7, 15, 32, 40, 64, 100, 500, 1023, 9999}) {
             if (k <= 1<<i) {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {(1<<i), 1, 1, 1}, k));
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {(1<<i) + 11, 1, 2, 1}, k));
@@ -10472,7 +10472,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 16));
         }
     }
-    for (auto k : {1, 4, 8, 10, 16, 32, 40, 400}) {
+    for (auto k : {1, 4, 8, 10, 16, 32, 40, 64, 400}) {
         for (auto nrows : {1, 16}) {
             for (auto cols : {k, 1000, 65000, 200000}) {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k));
