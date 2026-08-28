@@ -203,6 +203,16 @@ static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t /*dev*
     }
 }
 
+static bool ggml_backend_meta_device_event_query(ggml_backend_dev_t /*dev*/, ggml_backend_event_t event) {
+    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
+    for (ggml_backend_event_t e : ev_ctx->simple_events) {
+        if (e->device->iface.event_query != nullptr && !e->device->iface.event_query(e->device, e)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params);
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev);
@@ -346,6 +356,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ ggml_backend_meta_device_event_new,
     /* .event_free           = */ ggml_backend_meta_device_event_free,
     /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
+    /* .event_query          = */ ggml_backend_meta_device_event_query,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
