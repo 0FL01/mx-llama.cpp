@@ -553,7 +553,9 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     event->device->iface.event_synchronize(event->device, event);
 }
 
-bool ggml_backend_event_query(ggml_backend_event_t event) {
+GGML_API bool ggml_backend_event_query(ggml_backend_event_t event);
+
+GGML_API bool ggml_backend_event_query(ggml_backend_event_t event) {
     GGML_ASSERT(event);
 
     if (event->device->iface.event_query == NULL) {
