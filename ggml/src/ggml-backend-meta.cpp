@@ -2,7 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <execinfo.h>
 #endif
 #include "ggml-backend-impl.h"
@@ -3126,7 +3126,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
         }
         const double waited = ggml_time_us()/1000.0 - t0;
         fprintf(stderr, "[chunk] sync  t=%9.3f ms waited=%.3f ms\n", t0, waited);
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
         // name the caller of any expensive drain - every extern frame
         // symbolizes, which is enough to attribute the wait
         if (waited > 50.0) {
