@@ -479,6 +479,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
+            if (suffix_fallback.empty()) {
+                LLAMA_LOG_ERROR("%s: split-state lookup FAILED: tensor [%s] wanted sibling [%s%s] n_layer=%u nextn=%u ",
+                        __func__, tensor_name.c_str(), prefix.c_str(), suffix.c_str(),
+                        ud->model->hparams.n_layer(), ud->model->hparams.n_layer_nextn);
+            }
             GGML_ASSERT(!suffix_fallback.empty());
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
@@ -566,6 +571,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // The MTP draft block sits one block past the trunk and is loaded as its own
+        // model on a single device, yet it inherits the target's split mode and so
+        // still passes through here. Mirror it whole. Two reasons: its tensor set is
+        // not a trunk layer's, so the sibling lookups the rules below rely on would
+        // miss and abort on an empty fallback, and splitting a head that folds a
+        // 4-branch residual would allreduce a 10240-wide vector per drafted token.
+        if (ud->model->hparams.n_layer_nextn > 0) {
+            // A block index reaches here in two spellings: weights as blk.<il>.<name>
+            // and cache entries as cache_{k,v}_l<il>. Both must be mirrored for the MTP
+            // block, or a KV write ends up with src0 and src2 carrying different splits.
+            long il_blk = -1;
+            if (tensor_name.compare(0, 4, "blk.") == 0) {
+                const size_t dot = tensor_name.find('.', 4);
+                if (dot != std::string::npos) {
+                    il_blk = std::stol(tensor_name.substr(4, dot - 4));
+                }
+            } else if (tensor_name.compare(0, 6, "cache_") == 0) {
+                const size_t lpos = tensor_name.find("_l", 6);
+                if (lpos != std::string::npos) {
+                    il_blk = std::stol(tensor_name.substr(lpos + 2));
+                }
+            }
+            if (il_blk >= (long) ud->model->hparams.n_layer()) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+
         // Vocabulary-parallel logits are incompatible with any vocabulary-global op run
         // inside the graph. The DSpark draft head is exactly that: it chains
         // argmax(logits) -> get_rows(markov_w1) -> mul_mat(markov_w2) once per drafted
@@ -2893,17 +2925,40 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        // Key the filters on which tensors the FILE actually has, not on
+                        // layer arithmetic alone. A head-only export carries just the MTP
+                        // block, so a purely arithmetic filter admits trunk layers that were
+                        // never loaded and the split-state resolver then aborts looking for
+                        // their siblings (cache_k_l3 wanting blk.3.attn_output.weight).
+                        // An MTP context additionally wants ONLY the blocks past the trunk,
+                        // which is what separates it from a normal context over the same file.
+                        const bool mtp_ctx = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        filter_attn = [&, mtp_ctx](uint32_t il) {
+                            if (il >= layers.size() || layers[il].wo == nullptr) {
+                                return false;
+                            }
+                            return mtp_ctx ? il >= hparams.n_layer()
+                                           : il <  hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&, mtp_ctx](uint32_t il) {
+                            if (il >= layers.size() || layers[il].ssm_out == nullptr) {
+                                return false;
+                            }
+                            return mtp_ctx ? il >= hparams.n_layer()
+                                           : il <  hparams.n_layer() && hparams.is_recr(il);
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
                             // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            // same rule as filter_attn: the QSA indexer cache must cover
+                            // exactly the blocks that run, or the graph asks the cache for
+                            // a layer it never registered (map_layer_ids::at throws)
+                            filter_idx = [&, mtp_ctx](uint32_t il) {
+                                if (il >= layers.size() || layers[il].index_q_proj == nullptr) {
+                                    return false;
+                                }
+                                return mtp_ctx ? il >= hparams.n_layer()
+                                               : il <  hparams.n_layer() && !hparams.is_recr(il);
                             };
                         }
                     }

@@ -2674,6 +2674,7 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.NEXTN_EH_PROJ: (
+            "model.layers.{bid}.fc_embedding",                      # qwen4exp mtp
             "model.layers.{bid}.eh_proj",
         ),
 
@@ -2682,15 +2683,33 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.NEXTN_ENORM: (
+            "model.layers.{bid}.enorm",                             # qwen4exp mtp
             "model.layers.{bid}.enorm",
         ),
 
         MODEL_TENSOR.NEXTN_HNORM: (
+            "model.layers.{bid}.hnorm",                             # qwen4exp mtp
             "model.layers.{bid}.hnorm",
         ),
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
             "model.layers.{bid}.shared_head.head",
+        ),
+
+        MODEL_TENSOR.NEXTN_FC_HIDDEN: (
+            "model.layers.{bid}.fc_hidden",                 # qwen4exp mtp
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_NORM: (
+            "model.layers.{bid}.nextn_hc_norm",             # qwen4exp mtp
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_DOWN: (
+            "model.layers.{bid}.nextn_hc_down",             # qwen4exp mtp
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_UP: (
+            "model.layers.{bid}.nextn_hc_up",               # qwen4exp mtp
         ),
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
