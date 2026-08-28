@@ -364,6 +364,22 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+// PLE gather table VRAM shard, opt in with LLAMA_PLE_SHARD=1. Upstream's default is
+// a host resident, demand paged table: no VRAM, one PCIe read per token. The shard
+// splits the table across the TP group instead so the gather is local. Only -sm
+// tensor can split, so this does nothing in the other split modes.
+bool llama_ple_shard_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("LLAMA_PLE_SHARD");
+        const bool on = s != nullptr && atoi(s) != 0;
+        if (on) {
+            LLAMA_LOG_WARN("%s: LLAMA_PLE_SHARD=1, sharding the PLE gather table across the TP group\n", __func__);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -764,6 +780,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
+        if (llama_ple_shard_enabled()) {
+            // Split the PLE table along its ROW axis so each device owns a contiguous
+            // range of the gather rows. The key/value projections that consume the
+            // gathered vector need no rule of their own - the partial gathers are
+            // reduced back to a full mirrored vector before those projections read it.
+            if (tensor_name == "per_layer_token_embd.weight") {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+        }
+
         // everything else
         return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     };
@@ -1037,6 +1063,35 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     split_state.axis = tc.axis;
+
+    // Shard the gather table by WHOLE HEADS - one segment per head, each owned
+    // outright by one device - rather than letting the generic path slice every head
+    // across every device. That keeps the routing static: which device serves a
+    // lookup is fixed by the head index, a property of the graph and not of the
+    // token. Head groups are contiguous and unrotated so each device's slice is ONE
+    // contiguous global row range, which is what lets the masked gather test a single
+    // bound. A token still needs every head, so each device gathers the heads it owns,
+    // zeros the rows it does not, and one allreduce sums the partials into the vector.
+    if (llama_ple_shard_enabled() && tensor_name == "per_layer_token_embd.weight" &&
+            tc.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+        const size_t n_head_ple = hparams.ple_n_heads;
+        GGML_ASSERT(n_head_ple > 0 && n_head_ple <= 16);
+        GGML_ASSERT(n_lanes <= n_head_ple &&
+                "the PLE gather table needs at least one hash head per device");
+        int64_t assigned = 0;
+        size_t  j_last   = lane_base;
+        for (size_t s = 0; s < n_head_ple; s++) {
+            const size_t j = lane_base + s*n_lanes/n_head_ple;
+            split_state.ne[s*ud->n_devices + j] = (int64_t) hparams.ple_head_vocab_sizes[s];
+            split_state.nr[s] = 1;
+            assigned += (int64_t) hparams.ple_head_vocab_sizes[s];
+            j_last = j;
+        }
+        // the table is padded past the last head, that tail goes to its owner
+        split_state.ne[(n_head_ple - 1)*ud->n_devices + j_last] += tensor->ne[1] - assigned;
+        split_state.n_segments = n_head_ple;
+        return split_state;
+    }
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
@@ -2020,6 +2075,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             }
             if (!needs_alloc) {
+                // the context still owns the tensor structs, so the model has to keep it
+                // alive even though there is nothing to allocate for it
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
                 continue;
             }
         }
@@ -2158,8 +2216,31 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (narrow_shexp) {
         buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
     }
+    // The gather table is an input-class tensor, so it normally lands on the CPU and
+    // is read lazily. Sharding it means putting it back in VRAM across the TP group,
+    // which also means dropping the lazy flag - there is no file mapping to page from
+    // once it lives on the devices.
+    const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
+    if (tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) {
+        if (llama_ple_shard_enabled() && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                !pimpl->dev_layer.empty()) {
+            buft_list_input = pimpl->dev_layer[0].buft_list;
+            flags &= ~llama_model_loader::TENSOR_READ_LAZY;
+        } else {
+            // Pin it to plain CPU. The host placement must not depend on the CUDA
+            // GET_ROWS support check refusing a 160 wide IQ4_NL row: the shard's
+            // kernel fix relaxes exactly that check, and the table would then be
+            // accepted into VRAM and mirrored at 27 GB per device.
+            static const buft_list_t cpu_only = {
+                { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
+                  ggml_backend_cpu_buffer_type() }
+            };
+            buft_list_input = &cpu_only;
+        }
+    }
+
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 
@@ -2211,6 +2292,10 @@ llama_split_mode llama_model::split_mode() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (bufs.empty()) {
+            // context kept alive only to own tensors that live in a file mapping
+            continue;
+        }
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
