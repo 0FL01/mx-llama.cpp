@@ -136,7 +136,8 @@ output and identical draft acceptance.
 
 ## Qwen3.8-Flash-Next tensor parallelism
 
-Qwen3.8-Flash-Next carries a 27465 MiB PLE n-gram table that is otherwise host
+Qwen3.8-Flash-Next carries a PLE n-gram table - 27465 MiB on the UD-Q4_K_XL quant, larger at
+higher quants - that is otherwise host
 resident and demand paged, so every token pays a PCIe read to gather its rows and
 prefill is bound by that gather rather than by compute. `LLAMA_PLE_SHARD=1` splits
 the table by whole hash heads under `-sm tensor`, one segment owned per device, and
