@@ -1423,6 +1423,11 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // buffers over a file mapping for TENSOR_READ_LAZY tensors. Held separately from
+    // ctxs_bufs: they are not allocations, so they must not appear in the memory
+    // breakdown, and ctxs_bufs carries a one-buffer-per-context invariant.
+    std::vector<ggml_backend_buffer_ptr> lazy_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list_plain;
@@ -1971,12 +1976,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    // Bind lazily-read tensors straight to the file mapping. Must happen before the
+    // allocator below, which only sizes tensors whose data is still null - that is
+    // what keeps the gather table out of the allocation and off the host RSS.
+    for (auto & [buft_lazy, ctx_lazy] : ml.ctx_map) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_lazy.get()); t != nullptr;
+                t = ggml_get_next_tensor(ctx_lazy.get(), t)) {
+            void * addr = ml.lazy_tensor_addr(ggml_get_name(t));
+            if (addr == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_t lbuf = ggml_backend_cpu_buffer_from_ptr(addr, ggml_nbytes(t));
+            if (lbuf == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_set_usage(lbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            t->buffer = lbuf;
+            t->data   = addr;
+            pimpl->lazy_bufs.emplace_back(lbuf);
+            LLAMA_LOG_INFO("%s: tensor %s bound to its file mapping, rows read on demand\n",
+                    __func__, ggml_get_name(t));
+        }
+    }
+
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
+        }
+
+        // A context whose tensors are all bound to a file mapping has nothing left to
+        // allocate, and the allocator reports that with a null buffer - which the code
+        // below would otherwise treat as an allocation failure. The lazily read gather
+        // table is alone in its CPU context, so it hits this every time.
+        {
+            bool needs_alloc = false;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->data == nullptr && t->view_src == nullptr) {
+                    needs_alloc = true;
+                    break;
+                }
+            }
+            if (!needs_alloc) {
+                continue;
+            }
         }
 
         llama_buf_map buf_map;

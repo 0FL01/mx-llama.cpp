@@ -95,6 +95,11 @@ struct llama_model_loader {
     // byte ranges of TENSOR_READ_LAZY tensors, per file index
     std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
 
+    // Mapped address of a TENSOR_READ_LAZY tensor, or nullptr if it is not lazy or
+    // has no mapping. Used to bind the tensor straight to the file so the allocator
+    // skips it and its rows are demand-paged rather than read up front.
+    void * lazy_tensor_addr(const char * name) const;
+
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;

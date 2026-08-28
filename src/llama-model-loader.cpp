@@ -1308,7 +1308,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if ((flags & TENSOR_READ_LAZY) && use_mmap && lazy_mode != LLAMA_LAZY_MODE_OFF) {
+    // not gated on use_mmap: a lazy tensor gets its own file mapping even under
+    // dio, see init_mappings. That mapping is virtual only - prefetch 0 and the
+    // range is never populated - so it does not bring back whole-model mmap's
+    // page thrashing.
+    if ((flags & TENSOR_READ_LAZY) && lazy_mode != LLAMA_LAZY_MODE_OFF) {
         // in auto mode, small tensors are cheap enough to keep resident
         constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
         if (lazy_mode == LLAMA_LAZY_MODE_ON || ggml_nbytes(cur) > auto_lazy_min_size) {
@@ -1383,8 +1387,36 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+void * llama_model_loader::lazy_tensor_addr(const char * name) const {
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end()) {
+        return nullptr;
+    }
+    const auto & w = it->second;
+
+    const auto it_lazy = lazy_tensor_ranges.find(w.idx);
+    if (it_lazy == lazy_tensor_ranges.end() || w.idx >= mappings.size() || !mappings[w.idx]) {
+        return nullptr;
+    }
+
+    const size_t end = w.offs + ggml_nbytes(w.tensor);
+    for (const auto & r : it_lazy->second) {
+        if (w.offs >= r.first && end <= r.second) {
+            return (char *) mappings[w.idx]->addr() + w.offs;
+        }
+    }
+    return nullptr;
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-    if (use_mmap) {
+    // A TENSOR_READ_LAZY tensor needs a file mapping to demand-page its rows from.
+    // Under dio there is no mapping, so the tensor falls back to a full anonymous
+    // allocation - 27 GB for the qwen4exp PLE table, which OOMs the host. Map the
+    // files that hold lazy tensors anyway: with prefetch 0 and the range left
+    // unpopulated this is virtual address space only, so it does not reintroduce
+    // the page cache thrashing that makes whole-model mmap unusable here.
+    const bool map_for_lazy = !use_mmap && !lazy_tensor_ranges.empty();
+    if (use_mmap || map_for_lazy) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1404,7 +1436,15 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const auto it_lazy = lazy_tensor_ranges.find(idx);
             static const llama_mmap::ranges no_lazy_ranges;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa,
+            // under dio only the lazy ranges are wanted, so never prefetch, and skip
+            // files that hold no lazy tensor at all
+            if (map_for_lazy && it_lazy == lazy_tensor_ranges.end()) {
+                mappings.emplace_back(nullptr);
+                mmaps_used.emplace_back(0, 0);
+                continue;
+            }
+            const size_t prefetch_bytes = (use_mmap && prefetch) ? (size_t) -1 : 0;
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_bytes, is_numa,
                     it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
@@ -1635,6 +1675,12 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
+            if (lazy_tensor_addr(ggml_get_name(cur)) == cur->data) {
+                // already bound to the file mapping, reading it back would fault in
+                // every page the lazy path exists to leave untouched
+                size_done += n_size;
+                continue;
+            }
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
