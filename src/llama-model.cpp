@@ -368,7 +368,7 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 // a host resident, demand paged table: no VRAM, one PCIe read per token. The shard
 // splits the table across the TP group instead so the gather is local. Only -sm
 // tensor can split, so this does nothing in the other split modes.
-bool llama_ple_shard_enabled() {
+static bool llama_ple_shard_enabled() {
     static const bool enabled = [] {
         const char * s = getenv("LLAMA_PLE_SHARD");
         const bool on = s != nullptr && atoi(s) != 0;
