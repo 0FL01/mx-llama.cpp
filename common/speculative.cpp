@@ -3663,5 +3663,24 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            const auto * mtp = static_cast<const common_speculative_impl_draft_mtp *>(impl.get());
+            int64_t t_sampler_us = 0;
+            for (size_t seq_id = 0; seq_id < mtp->smpls.size(); ++seq_id) {
+                LOG_INF("statistics %16s: draft sampler seq=%zu\n",
+                        common_speculative_type_to_str(impl->type).c_str(), seq_id);
+                common_perf_print(nullptr, mtp->smpls[seq_id].get());
+                t_sampler_us += common_sampler_get_time_us(mtp->smpls[seq_id].get());
+            }
+
+            const int64_t t_model_sync_us = std::max<int64_t>(0, impl->t_draft_us - t_sampler_us);
+            const double sampler_share = impl->t_draft_us > 0
+                ? 100.0 * (double) t_sampler_us / (double) impl->t_draft_us
+                : 0.0;
+            LOG_INF("statistics %16s: draft split sampler(host)=%.3f ms, model+sync+other=%.3f ms, sampler=%.2f%%\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    t_sampler_us / 1000.0, t_model_sync_us / 1000.0, sampler_share);
+        }
     }
 }
