@@ -865,15 +865,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
-        // Opt-in LoRA path: B is mirrored while A*x is a lane-local partial.
-        // Keep B*(A*x) partial so it can share the parent projection's AllReduce.
-        if ((tensor->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) &&
-                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-            GGML_ASSERT(tensor->op == GGML_OP_MUL_MAT);
-            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL,
-                    {0}, {1}, 1};
-        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
@@ -1184,15 +1175,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
 
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
-        const bool lora_ar_propagate = (tensor->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) &&
-                (tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_SCALE);
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 continue;
             }
-            src_ss[i] = ggml_backend_meta_get_split_state(
-                    stc, tensor->src[i], /*assume_sync =*/ !lora_ar_propagate);
+            src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
@@ -1261,13 +1249,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_SCALE: {
-                if ((tensor->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) &&
-                        src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                    split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL,
-                            {0}, {1}, 1};
-                } else {
-                    split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-                }
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_SET: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -3233,10 +3215,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             stc.simple_tensors.clear();
         }
-        size_t n_subgraphs       = 0;
-        size_t max_tmp_size      = 0;
-        size_t n_lora_projections = 0;
-        size_t n_lora_ar_fused    = 0;
+        size_t n_subgraphs  = 0;
+        size_t max_tmp_size = 0;
         backend_ctx->graph_has_moe_ops = false;
 
         for (size_t j = 0; j < n_backends; j++) {
@@ -3256,12 +3236,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
             }
-        }
-
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            const ggml_tensor * node = cgraph->nodes[i];
-            n_lora_projections += node->op == GGML_OP_ADD &&
-                    (node->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE);
         }
 
         {
@@ -3316,33 +3290,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         n_used = ggml_node_get_use_count(cgraph, id);
                     }
                 }
-                // Opt-in LoRA chain: A*x (PARTIAL) -> B*(A*x) -> scale. These nodes
-                // remain lane-local and are folded into the parent projection's AR.
-                while (true) {
-                    skip_unrelated();
-                    if (id + 1 >= cgraph->n_nodes || n_used != 1) {
-                        return idr;
-                    }
-                    ggml_tensor * next = cgraph->nodes[id + 1];
-                    const bool lora_mm = (next->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) &&
-                            next->op == GGML_OP_MUL_MAT && next->src[1] == node &&
-                            ggml_backend_meta_get_split_state(next->src[0], false).axis ==
-                                    GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                            ggml_backend_meta_get_split_state(next, false).axis ==
-                                    GGML_BACKEND_SPLIT_AXIS_PARTIAL;
-                    const bool lora_scale = (next->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) &&
-                            next->op == GGML_OP_SCALE && next->src[0] == node &&
-                            ggml_backend_meta_get_split_state(next, false).axis ==
-                                    GGML_BACKEND_SPLIT_AXIS_PARTIAL;
-                    if (!lora_mm && !lora_scale) {
-                        break;
-                    }
-                    node = next;
-                    id++;
-                    idr = id;
-                    n_used = ggml_node_get_use_count(cgraph, id);
-                }
-
                 // Chain of MULs with MIRRORED src[1]
                 while (true) {
                     skip_unrelated();
@@ -3447,9 +3394,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         if (compute != compute_other) {
                             return i_delayed;
                         }
-                    }
-                    if (sum->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) {
-                        n_lora_ar_fused++;
                     }
                     return i_other_delayed + 1;
                 }
@@ -3871,9 +3815,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 if (other != nullptr &&
                                         ggml_backend_meta_get_split_state(other, false).axis ==
                                         GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                                    if (cons->flags & GGML_TENSOR_FLAG_LORA_AR_FUSE) {
-                                        n_lora_ar_fused++;
-                                    }
                                     i_delayed = k;
                                 }
                             }
@@ -3986,13 +3927,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->subgraphs[s].xfer = collect_xfer_set(boundary_idx);
                     }
                 }
-            }
-
-            if (n_lora_projections > 0) {
-                GGML_ASSERT(n_lora_ar_fused <= n_lora_projections);
-                GGML_LOG_WARN("[meta-lora] projections=%zu ar_fused=%zu ar_unfused=%zu collectives_avoided=%zu subgraphs=%zu\n",
-                        n_lora_projections, n_lora_ar_fused,
-                        n_lora_projections - n_lora_ar_fused, n_lora_ar_fused, n_subgraphs);
             }
 
             // GGML_META_PART_DEBUG=1 dumps per-subgraph stage/closure summary on rebuild.
