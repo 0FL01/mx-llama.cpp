@@ -653,6 +653,9 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // Opt-in hint for the CUDA backend to fuse a LoRA B MMV epilogue
+        // (scalar scale plus parent projection add) without changing graph math.
+        GGML_TENSOR_FLAG_LORA_MMV_FUSE = 32,
     };
 
     enum ggml_tri_type {

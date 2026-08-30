@@ -55,6 +55,7 @@ static __global__ void mul_mat_vec_f(
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
+    bool use_scale = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
@@ -64,6 +65,7 @@ static __global__ void mul_mat_vec_f(
         use_gate = fusion.gate != nullptr;
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
+        use_scale = fusion.use_x_scale_scalar;
         glu_op = fusion.glu_op;
 
         if (use_gate) {
@@ -345,6 +347,9 @@ static __global__ void mul_mat_vec_f(
     float value = sumf[tid];
 
     if constexpr (has_fusion) {
+        if (use_scale) {
+            value *= fusion.x_scale_scalar;
+        }
         if (use_bias) {
             value += x_bias[tid*stride_col_dst + row];
         }
@@ -374,7 +379,7 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
     }
 }
 
@@ -389,18 +394,15 @@ static void mul_mat_vec_f_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
-    if constexpr (ncols_dst == 1) {
-        if (has_fusion) {
-            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
-                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
-                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-            return;
-       }
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+            fusion.use_x_scale_scalar;
+    if (has_fusion) {
+        ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
+            x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        return;
     }
-
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
@@ -444,7 +446,8 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+            fusion.use_x_scale_scalar;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
@@ -657,7 +660,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        const bool lora_multi_token = !ids && fusion->use_x_scale_scalar && fusion->x_bias != nullptr &&
+                fusion->gate == nullptr && fusion->gate_bias == nullptr && dst->ne[1] >= 1 && dst->ne[1] <= 8;
+        GGML_ASSERT(ids || dst->ne[1] == 1 || lora_multi_token);
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -674,6 +679,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
+        fusion_local.x_scale_scalar = fusion->x_scale_scalar;
+        fusion_local.use_x_scale_scalar = fusion->use_x_scale_scalar;
         fusion_local.glu_op = fusion->glu_op;
     }
 

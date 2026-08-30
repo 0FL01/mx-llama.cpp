@@ -2383,6 +2383,22 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+static bool ggml_cuda_should_fuse_lora_mul_mat_vec_f(const ggml_tensor * tensor) {
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+
+    if (tensor->op != GGML_OP_MUL_MAT || ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || tensor->type != GGML_TYPE_F32 ||
+            tensor->ne[1] < 1 || tensor->ne[1] > 8) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -4810,6 +4826,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
+
+    // LoRA-only F32 MMV epilogue: preserve A -> AllReduce -> B order,
+    // but execute B, scalar scale and parent projection add in one kernel.
+    {
+        const int n_ops = 3;
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_ADD };
+        const int out_nodes[] = { i + 2 };
+        if (i + 2 < cgraph->n_nodes &&
+                ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1)) {
+            ggml_tensor * mm_node    = cgraph->nodes[i];
+            ggml_tensor * scale_node = cgraph->nodes[i + 1];
+            ggml_tensor * out_node   = cgraph->nodes[i + 2];
+            const bool marked = (mm_node->flags & GGML_TENSOR_FLAG_LORA_MMV_FUSE) &&
+                    (scale_node->flags & GGML_TENSOR_FLAG_LORA_MMV_FUSE) &&
+                    (out_node->flags & GGML_TENSOR_FLAG_LORA_MMV_FUSE);
+            const ggml_tensor * bias = marked ? get_bias_tensor(out_node, scale_node, GGML_OP_ADD) : nullptr;
+            const float scale = ggml_get_op_params_f32(scale_node, 0);
+            const float scale_bias = ggml_get_op_params_f32(scale_node, 1);
+
+            // The allocator commonly aliases the ADD output with its parent
+            // projection input. That exact in-place bias read/write is safe here:
+            // one kernel thread reads and then overwrites the same output element.
+            const bool bias_inplace = bias != nullptr && bias->data == out_node->data &&
+                    ggml_are_same_shape(bias, out_node) && ggml_are_same_stride(bias, out_node);
+            const bool external_ranges_ok = bias_inplace ||
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1);
+
+            if (marked && scale_node->src[0] == mm_node && bias != nullptr && scale_bias == 0.0f &&
+                    ggml_are_same_shape(mm_node, scale_node) && ggml_are_same_shape(scale_node, out_node) &&
+                    ggml_are_same_shape(bias, out_node) && ggml_is_contiguous(bias) && ggml_is_contiguous(out_node) &&
+                    external_ranges_ok && ggml_cuda_should_fuse_lora_mul_mat_vec_f(mm_node)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_bias = bias;
+                fusion_data.x_scale_scalar = scale;
+                fusion_data.use_x_scale_scalar = true;
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr, out_node, &fusion_data);
+                GGML_LOG_WARN_ONCE("[cuda-lora] F32 MMV scale+bias fusion active\n");
+                return n_ops - 1;
+            }
+        }
+    }
 
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
