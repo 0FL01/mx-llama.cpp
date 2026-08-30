@@ -1590,13 +1590,23 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
+        ggml_tensor * a_cur  = ggml_mul_mat(ctx0, lw->a, cur);
+        ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, a_cur);
+        ggml_tensor * scaled = ggml_scale(ctx0, ab_cur, scale);
+        ggml_tensor * sum    = ggml_add(ctx0, res, scaled);
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        static const bool fuse_ar = []() {
+            const char * env = getenv("GGML_META_LORA_FUSE_AR");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (fuse_ar) {
+            a_cur->flags  |= GGML_TENSOR_FLAG_LORA_AR_FUSE;
+            ab_cur->flags |= GGML_TENSOR_FLAG_LORA_AR_FUSE;
+            scaled->flags |= GGML_TENSOR_FLAG_LORA_AR_FUSE;
+            sum->flags    |= GGML_TENSOR_FLAG_LORA_AR_FUSE;
+        }
+
+        res = sum;
     }
 
     return res;
