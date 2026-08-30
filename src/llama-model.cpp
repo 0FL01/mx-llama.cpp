@@ -387,6 +387,43 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
+    // A row-parallel parent contracts an AXIS_0 input shard. Its LoRA A factor
+    // must own the same input slice so A*x can all-reduce the rank-sized
+    // partials; B then consumes that mirrored rank vector and stays mirrored.
+    // Fail closed for other parent layouts until their LoRA graph is routed
+    // explicitly instead of accepting a mathematically invalid split.
+    static constexpr const char * lora_suffix_a = ".lora_a";
+    static constexpr const char * lora_suffix_b = ".lora_b";
+    const bool is_lora_a = tensor_name.size() > strlen(lora_suffix_a) &&
+        tensor_name.compare(tensor_name.size() - strlen(lora_suffix_a), strlen(lora_suffix_a), lora_suffix_a) == 0;
+    const bool is_lora_b = tensor_name.size() > strlen(lora_suffix_b) &&
+        tensor_name.compare(tensor_name.size() - strlen(lora_suffix_b), strlen(lora_suffix_b), lora_suffix_b) == 0;
+    if (is_lora_a || is_lora_b) {
+        const size_t suffix_len = strlen(is_lora_a ? lora_suffix_a : lora_suffix_b);
+        const std::string parent_name = tensor_name.substr(0, tensor_name.size() - suffix_len);
+        const ggml_tensor * parent = ud->model->get_tensor(parent_name.c_str());
+        GGML_ASSERT(parent != nullptr && "LoRA tensor must resolve its parent model tensor");
+
+        const ggml_backend_meta_split_state parent_state = llama_meta_device_get_split_state(parent, userdata);
+        GGML_ASSERT(parent_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                    "tensor-mode LoRA currently supports row-parallel parent tensors only");
+        GGML_ASSERT(ggml_n_dims(tensor) == 2 && ggml_n_dims(parent) == 2);
+
+        if (is_lora_a) {
+            GGML_ASSERT(tensor->ne[0] == parent->ne[0] &&
+                        "LoRA A input dimension must match its parent tensor");
+            return parent_state;
+        }
+
+        GGML_ASSERT(tensor->ne[1] == parent->ne[1] &&
+                    "LoRA B output dimension must match its parent tensor");
+        ggml_backend_meta_split_state split_state = {};
+        split_state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        split_state.nr[0] = 1;
+        split_state.n_segments = 1;
+        return split_state;
+    }
+
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
