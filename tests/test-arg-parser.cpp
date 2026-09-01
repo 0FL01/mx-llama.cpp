@@ -255,6 +255,43 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
 
     {
+        common_params params_mtp;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-draft-n-max", "5", "--spec-mtp-cr-depth", "1"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params_mtp, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(params_mtp.speculative.draft.n_max == 5);
+        assert(params_mtp.speculative.draft.n_rs_seq == 1);
+
+        params_mtp.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        assert(params_mtp.speculative.need_n_rs_seq() == 1);
+
+        params_mtp.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
+        assert(params_mtp.speculative.need_n_rs_seq() == 5);
+    }
+
+    {
+        common_params params_mtp;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-draft-n-max", "5"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params_mtp, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(params_mtp.speculative.draft.n_rs_seq == -1);
+
+        params_mtp.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        assert(params_mtp.speculative.need_n_rs_seq() == 5);
+    }
+
+    {
+        common_params params_mtp;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-mtp-cr-depth", "1", "--spec-draft-n-max", "5"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params_mtp, LLAMA_EXAMPLE_SPECULATIVE));
+        assert(params_mtp.speculative.draft.n_rs_seq == 1);
+    }
+
+    {
+        common_params params_mtp;
+        argv = {"binary_name", "-m", "abc.gguf", "--spec-mtp-cr-depth", "6", "--spec-draft-n-max", "5"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params_mtp, LLAMA_EXAMPLE_SPECULATIVE));
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
