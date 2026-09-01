@@ -2048,10 +2048,13 @@ static ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(ggml_tensor *
     return ggml_backend_meta_buffer_simple_tensor(tensor, index);
 }
 
-static bool ggml_backend_meta_buffer_copy_tensor(
+using ggml_backend_meta_tensor_copies = std::vector<std::pair<const ggml_tensor *, ggml_tensor *>>;
+
+static bool ggml_backend_meta_prepare_tensor_copies(
         ggml_backend_buffer_t buffer,
         const ggml_tensor * src,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        ggml_backend_meta_tensor_copies & copies) {
     if (src->buffer == nullptr || dst->buffer == nullptr ||
             !ggml_backend_buffer_is_meta(src->buffer) ||
             !ggml_backend_buffer_is_meta(dst->buffer) ||
@@ -2065,7 +2068,7 @@ static bool ggml_backend_meta_buffer_copy_tensor(
         return false;
     }
 
-    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> copies;
+    copies.clear();
     copies.reserve(n_bufs);
     for (size_t i = 0; i < n_bufs; ++i) {
         const ggml_tensor * src_simple = ggml_backend_meta_buffer_ensure_simple_tensor(
@@ -2077,8 +2080,40 @@ static bool ggml_backend_meta_buffer_copy_tensor(
         copies.emplace_back(src_simple, dst_simple);
     }
 
+    return true;
+}
+
+static bool ggml_backend_meta_buffer_copy_tensor(
+        ggml_backend_buffer_t buffer,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    ggml_backend_meta_tensor_copies copies;
+    if (!ggml_backend_meta_prepare_tensor_copies(buffer, src, dst, copies)) {
+        return false;
+    }
     for (const auto & [src_simple, dst_simple] : copies) {
         ggml_backend_tensor_copy(src_simple, dst_simple);
+    }
+    return true;
+}
+
+bool ggml_backend_meta_tensor_copy_async(
+        ggml_backend_t backend,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    if (!ggml_backend_is_meta(backend) || dst->buffer == nullptr) {
+        return false;
+    }
+
+    ggml_backend_meta_tensor_copies copies;
+    if (!ggml_backend_meta_prepare_tensor_copies(dst->buffer, src, dst, copies) ||
+            copies.size() != ggml_backend_meta_n_backends(backend)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < copies.size(); ++i) {
+        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
+        ggml_backend_tensor_copy_async(simple, simple, copies[i].first, copies[i].second);
     }
     return true;
 }
