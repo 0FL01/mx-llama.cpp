@@ -2031,6 +2031,23 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 }
 
+static ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(ggml_tensor * tensor, size_t index) {
+    ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, index);
+    if (simple != nullptr) {
+        return simple;
+    }
+
+    if (tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer) &&
+            ggml_backend_meta_buffer_ensure_simple_tensor(tensor->view_src, index) == nullptr) {
+        return nullptr;
+    }
+
+    if (ggml_backend_meta_buffer_init_tensor(tensor->buffer, tensor) != GGML_STATUS_SUCCESS) {
+        return nullptr;
+    }
+    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
+}
+
 static bool ggml_backend_meta_buffer_copy_tensor(
         ggml_backend_buffer_t buffer,
         const ggml_tensor * src,
@@ -2048,18 +2065,20 @@ static bool ggml_backend_meta_buffer_copy_tensor(
         return false;
     }
 
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> copies;
+    copies.reserve(n_bufs);
     for (size_t i = 0; i < n_bufs; ++i) {
-        const ggml_tensor * src_simple = ggml_backend_meta_buffer_simple_tensor(src, i);
-        const ggml_tensor * dst_simple = ggml_backend_meta_buffer_simple_tensor(dst, i);
-        if (!ggml_are_same_layout(src_simple, dst_simple)) {
+        const ggml_tensor * src_simple = ggml_backend_meta_buffer_ensure_simple_tensor(
+                const_cast<ggml_tensor *>(src), i);
+        ggml_tensor * dst_simple = ggml_backend_meta_buffer_ensure_simple_tensor(dst, i);
+        if (src_simple == nullptr || dst_simple == nullptr || !ggml_are_same_layout(src_simple, dst_simple)) {
             return false;
         }
+        copies.emplace_back(src_simple, dst_simple);
     }
 
-    for (size_t i = 0; i < n_bufs; ++i) {
-        ggml_backend_tensor_copy(
-                ggml_backend_meta_buffer_simple_tensor(src, i),
-                ggml_backend_meta_buffer_simple_tensor(dst, i));
+    for (const auto & [src_simple, dst_simple] : copies) {
+        ggml_backend_tensor_copy(src_simple, dst_simple);
     }
     return true;
 }
