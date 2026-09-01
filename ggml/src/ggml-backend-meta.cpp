@@ -2031,6 +2031,39 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 }
 
+static bool ggml_backend_meta_buffer_copy_tensor(
+        ggml_backend_buffer_t buffer,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    if (src->buffer == nullptr || dst->buffer == nullptr ||
+            !ggml_backend_buffer_is_meta(src->buffer) ||
+            !ggml_backend_buffer_is_meta(dst->buffer) ||
+            ggml_backend_buffer_get_type(src->buffer) != ggml_backend_buffer_get_type(dst->buffer) ||
+            !ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    if (n_bufs != ggml_backend_meta_buffer_n_bufs(src->buffer)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n_bufs; ++i) {
+        const ggml_tensor * src_simple = ggml_backend_meta_buffer_simple_tensor(src, i);
+        const ggml_tensor * dst_simple = ggml_backend_meta_buffer_simple_tensor(dst, i);
+        if (!ggml_are_same_layout(src_simple, dst_simple)) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < n_bufs; ++i) {
+        ggml_backend_tensor_copy(
+                ggml_backend_meta_buffer_simple_tensor(src, i),
+                ggml_backend_meta_buffer_simple_tensor(dst, i));
+    }
+    return true;
+}
+
 static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     const size_t n_buffers = ggml_backend_meta_buffer_n_bufs(buffer);
     for (size_t i = 0; i < n_buffers; i++) {
@@ -2055,7 +2088,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
     /* .get_tensor_2d   = */ nullptr,
-    /* .cpy_tensor      = */ nullptr,
+    /* .cpy_tensor      = */ ggml_backend_meta_buffer_copy_tensor,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
 };
