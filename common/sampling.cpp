@@ -583,6 +583,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
     }
 }
 
+int64_t common_sampler_get_time_us(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->t_total_us : 0;
+}
+
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return nullptr;

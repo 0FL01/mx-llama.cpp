@@ -693,6 +693,11 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (smpl) {
+            SLT_INF(*this, "%s\n", "target sampler performance");
+            common_perf_print(nullptr, smpl.get());
+        }
+
         common_speculative_print_stats(spec);
     }
 

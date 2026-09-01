@@ -52,6 +52,10 @@ void                    common_sampler_copy  (const struct common_sampler * src,
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 
+// Host-side time accumulated by common_sampler_sample()/accept(), excluding
+// the llama_context synchronization that precedes sampling.
+int64_t common_sampler_get_time_us(const struct common_sampler * gsmpl);
+
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 

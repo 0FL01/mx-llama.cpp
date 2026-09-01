@@ -1582,6 +1582,18 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul(ctx0, res, w_s);
     }
 
+    static const bool fuse_lora_mmv = []() {
+        const char * env = getenv("GGML_CUDA_LORA_MMV_FUSE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
+    size_t n_lora_weights = 0;
+    if (fuse_lora_mmv) {
+        for (const auto & lora : *loras) {
+            n_lora_weights += lora.first->get_weight(w) != nullptr;
+        }
+    }
+
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -1591,13 +1603,21 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
+        ggml_tensor * a_cur  = ggml_mul_mat(ctx0, lw->a, cur);
+        ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lw->b, a_cur);
+        ggml_tensor * scaled = ggml_scale(ctx0, ab_cur, scale);
+        ggml_tensor * sum    = ggml_add(ctx0, res, scaled);
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        // The CUDA backend may fuse only this exact B -> scale -> add chain.
+        // A and its tensor-parallel AllReduce remain untouched, preserving the
+        // original numerical order and providing an exact fallback otherwise.
+        if (fuse_lora_mmv && n_lora_weights == 1) {
+            ab_cur->flags |= GGML_TENSOR_FLAG_LORA_MMV_FUSE;
+            scaled->flags |= GGML_TENSOR_FLAG_LORA_MMV_FUSE;
+            sum->flags    |= GGML_TENSOR_FLAG_LORA_MMV_FUSE;
+        }
+
+        res = sum;
     }
 
     return res;
