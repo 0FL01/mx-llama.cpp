@@ -2346,7 +2346,11 @@ const float * llama_model::tensor_split() const {
 }
 
 bool llama_model::tensor_mirror_output() const {
-    return pimpl->tensor_mirror_output;
+    static const bool force_mirror = [] {
+        const char * env = getenv("LLAMA_META_MIRROR_OUTPUT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return pimpl->tensor_mirror_output || force_mirror;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
