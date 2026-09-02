@@ -117,6 +117,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_chain(bool value);
     void set_mtp_prefill_kv_only(bool value) { cparams.mtp_prefill_kv_only = value; }
     // Enable (n_tokens_cap > 0) or disable (0) a pinned position-indexed pre-norm accum
     // buffer for MTP deferred prefill. Returns the buffer base (or nullptr).

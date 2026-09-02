@@ -100,6 +100,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Run the DECODER_MTP graph in chained mode: the first row carries the real
+// token/hidden inputs and each following row consumes the previous row's
+// in-graph argmax and hidden state.
+LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
+
 // Phase 2b: when enabled, the MTP head graph builds and stores ONLY its K/V (skips the
 // discarded attention/FFN/output). Enable around the deferred-prefill replay (a pure prompt
 // KV-build whose head output is unused), disable for generation drafting (which needs logits).

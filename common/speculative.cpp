@@ -1765,6 +1765,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    chain_graph   = false;   // qwen35: all draft steps in one graph
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1859,9 +1860,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
+        const char * chain_env = std::getenv("LLAMA_SPEC_CHAIN");
+        const bool chain_requested = chain_env != nullptr && std::strcmp(chain_env, "0") != 0;
+
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        if (this->params.backend_sampling && !chain_requested) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1880,6 +1884,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        chain_graph   = chain_requested && !is_mem_shared && !chain_heads && n_seq == 1;
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -2235,6 +2240,81 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::vector<bool> drafting(n_seq);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // Qwen35 chained drafting emits every proposal from one graph. Keep the
+        // generic path for single-token tails and unsupported multi-sequence rounds.
+        if (chain_graph) {
+            llama_seq_id seq_one = -1;
+            int n_seq_drafting = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting && !(adaptive_disable && disabled[seq_id])) {
+                    seq_one = seq_id;
+                    ++n_seq_drafting;
+                }
+            }
+
+            if (n_seq_drafting == 1) {
+                auto & dp = dparams[seq_one];
+                auto & result = *dp.result;
+
+                int32_t n_chain = params.n_max;
+                if (dp.n_max > 0) {
+                    n_chain = std::min(n_chain, dp.n_max);
+                }
+
+                if (n_chain > 1) {
+                    for (int32_t j = 0; j < n_chain; ++j) {
+                        common_batch_add(batch, j == 0 ? dp.id_last : 0,
+                                dp.n_past + j, { seq_one }, true);
+                        float * h_row = batch.embd + (size_t) j * n_embd;
+                        if (j == 0) {
+                            std::memcpy(h_row, pending_h[seq_one].data(), row_bytes);
+                        } else {
+                            std::memset(h_row, 0, row_bytes);
+                        }
+                    }
+
+                    llama_set_mtp_chain(ctx_dft, true);
+                    const int ret = llama_decode(ctx_dft, batch);
+                    llama_set_mtp_chain(ctx_dft, false);
+
+                    if (ret != 0) {
+                        SPC_ERR("llama_decode(chain) returned %d\n", ret);
+                        return;
+                    }
+
+                    // Each graph row emits two packed floats: [token id, top probability].
+                    const float * output = llama_get_logits(ctx_dft);
+                    for (int32_t j = 0; j < n_chain; ++j) {
+                        const llama_token id = (llama_token) output[2*j + 0];
+                        const float p = output[2*j + 1];
+
+                        if (!std::isfinite(p)) {
+                            disable_seq(seq_one, "non-finite chained draft probability");
+                            break;
+                        }
+
+                        SPC_DBG(" - seq_id %d, chain candidate %3d: %6d (%8.3f) '%s'\n",
+                                seq_one, j, id, p,
+                                common_token_to_piece(ctx_dft, id).c_str());
+
+                        if (p < params.p_min) {
+                            break;
+                        }
+
+                        result.push_back(id);
+                        if ((int32_t) result.size() >= n_chain) {
+                            break;
+                        }
+                    }
+
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                    }
+                    return;
+                }
+            }
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -3145,6 +3225,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }
+    }
+
+    const char * chain_env = std::getenv("LLAMA_SPEC_CHAIN");
+    if (chain_env != nullptr && std::strcmp(chain_env, "0") != 0) {
+        const int32_t per_seq = std::max(1, params_spec.n_max);
+        result.n_outputs_max = std::max(result.n_outputs_max, params.n_parallel * per_seq);
     }
 
     return result;

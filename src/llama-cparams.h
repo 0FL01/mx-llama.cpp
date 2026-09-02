@@ -36,6 +36,7 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool mtp_prefill_kv_only = false; // Phase 2b: MTP head stores only K/V (skip attn/FFN/output) during deferred prefill replay
+    bool mtp_chain = false;        // DECODER_MTP: feed each row from the previous row in-graph
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
