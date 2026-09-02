@@ -1765,7 +1765,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
-    bool    chain_graph   = false;   // qwen35: all draft steps in one graph
+    bool    chain_graph            = false; // qwen35: all draft steps in one graph
+    bool    chain_need_probability = false; // p_min filtering needs the top-token probability
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1885,6 +1886,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         chain_graph   = chain_requested && !is_mem_shared && !chain_heads && n_seq == 1;
+        chain_need_probability = this->params.p_min > 0.0f;
+
+        if (chain_graph) {
+            llama_set_mtp_chain_need_probability(ctx_dft, chain_need_probability);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -2283,22 +2289,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         return;
                     }
 
-                    // Each graph row emits two packed floats: [token id, top probability].
+                    // Each graph row emits [token id, probability] when p_min
+                    // filters candidates, or [token id, finite-status] otherwise.
                     const float * output = llama_get_logits(ctx_dft);
                     for (int32_t j = 0; j < n_chain; ++j) {
                         const llama_token id = (llama_token) output[2*j + 0];
-                        const float p = output[2*j + 1];
+                        const float value = output[2*j + 1];
 
-                        if (!std::isfinite(p)) {
-                            disable_seq(seq_one, "non-finite chained draft probability");
+                        if (!std::isfinite(value)) {
+                            disable_seq(seq_one, "non-finite chained draft output");
                             break;
                         }
 
-                        SPC_DBG(" - seq_id %d, chain candidate %3d: %6d (%8.3f) '%s'\n",
-                                seq_one, j, id, p,
+                        SPC_DBG(" - seq_id %d, chain candidate %3d: %6d (%s=%8.3f) '%s'\n",
+                                seq_one, j, id, chain_need_probability ? "p" : "status", value,
                                 common_token_to_piece(ctx_dft, id).c_str());
 
-                        if (p < params.p_min) {
+                        if (chain_need_probability && value < params.p_min) {
                             break;
                         }
 

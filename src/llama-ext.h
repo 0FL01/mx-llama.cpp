@@ -105,6 +105,10 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // in-graph argmax and hidden state.
 LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
 
+// Keep the chained graph's top-token probability for p_min filtering. When
+// disabled, the graph emits only a finite-status scalar alongside each token.
+LLAMA_API void llama_set_mtp_chain_need_probability(struct llama_context * ctx, bool value);
+
 // Phase 2b: when enabled, the MTP head graph builds and stores ONLY its K/V (skips the
 // discarded attention/FFN/output). Enable around the deferred-prefill replay (a pure prompt
 // KV-build whose head output is unused), disable for generation drafting (which needs logits).

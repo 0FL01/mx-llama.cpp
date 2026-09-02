@@ -685,13 +685,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             }
 
             ggml_tensor * id = ggml_argmax(ctx0, logits);
-            ggml_tensor * probs = ggml_soft_max(ctx0, logits);
-            ggml_tensor * prob = ggml_get_rows(ctx0,
-                    ggml_reshape_2d(ctx0, probs, 1, probs->ne[0]), id);
-            prob = ggml_reshape_2d(ctx0, prob, 1, 1);
+            ggml_tensor * value;
+            if (cparams.mtp_chain_need_probability) {
+                ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+                value = ggml_get_rows(ctx0,
+                        ggml_reshape_2d(ctx0, probs, 1, probs->ne[0]), id);
+                value = ggml_reshape_2d(ctx0, value, 1, 1);
+            } else {
+                // Preserve the non-finite fail-safe without materializing a
+                // softmax tensor when p_min cannot reject a valid candidate.
+                value = ggml_reshape_2d(ctx0, ggml_sum(ctx0, logits), 1, 1);
+            }
             ggml_tensor * id_f = ggml_cast(ctx0,
                     ggml_reshape_2d(ctx0, id, 1, 1), GGML_TYPE_F32);
-            ggml_tensor * packed = ggml_concat(ctx0, id_f, prob, 0);
+            ggml_tensor * packed = ggml_concat(ctx0, id_f, value, 0);
 
             logits_all = logits_all == nullptr ? packed : ggml_concat(ctx0, logits_all, packed, 1);
             h_all = h_all == nullptr ? h_next : ggml_concat(ctx0, h_all, h_next, 1);
