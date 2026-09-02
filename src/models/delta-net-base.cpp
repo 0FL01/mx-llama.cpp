@@ -500,10 +500,14 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_tok = conv_input->ne[0] - conv_states->ne[0];
+
+        // Preserve deeper snapshots written by an earlier larger batch. A short
+        // speculative batch only defines the current state and n_tok rollbacks.
+        const int64_t K = std::min<int64_t>((int64_t) cparams.n_rs_seq, n_tok) + 1;
 
         for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+            const int64_t s_idx  = n_tok - K + t;
             const int64_t s_slot = K - t;
 
             ggml_tensor * conv_state_last =
