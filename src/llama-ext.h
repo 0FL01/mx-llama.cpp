@@ -85,6 +85,7 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+LLAMA_API int32_t llama_model_tensor_parallel_size(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
@@ -108,6 +109,9 @@ LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
 // Keep the chained graph's top-token probability for p_min filtering. When
 // disabled, the graph emits only a finite-status scalar alongside each token.
 LLAMA_API void llama_set_mtp_chain_need_probability(struct llama_context * ctx, bool value);
+
+// Reduce a TP2 vocabulary-sharded output head to the chained graph's global top token.
+LLAMA_API void llama_set_mtp_chain_sharded_head(struct llama_context * ctx, bool value);
 
 // Phase 2b: when enabled, the MTP head graph builds and stores ONLY its K/V (skips the
 // discarded attention/FFN/output). Enable around the deferred-prefill replay (a pure prompt

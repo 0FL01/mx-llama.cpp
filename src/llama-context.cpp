@@ -1305,6 +1305,10 @@ void llama_context::set_mtp_chain_need_probability(bool value) {
     cparams.mtp_chain_need_probability = value;
 }
 
+void llama_context::set_mtp_chain_sharded_head(bool value) {
+    cparams.mtp_chain_sharded_head = value;
+}
+
 float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
     if (n_tokens_cap <= 0) {
         buf_pre_norm_accum.reset();
@@ -4520,6 +4524,10 @@ void llama_set_mtp_chain(llama_context * ctx, bool value) {
 
 void llama_set_mtp_chain_need_probability(llama_context * ctx, bool value) {
     ctx->set_mtp_chain_need_probability(value);
+}
+
+void llama_set_mtp_chain_sharded_head(llama_context * ctx, bool value) {
+    ctx->set_mtp_chain_sharded_head(value);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

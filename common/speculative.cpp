@@ -1767,6 +1767,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
     bool    chain_graph            = false; // qwen35: all draft steps in one graph
     bool    chain_need_probability = false; // p_min filtering needs the top-token probability
+    bool    chain_sharded_head      = false; // TP2 output head uses device-side global top-1
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1863,6 +1864,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const char * chain_env = std::getenv("LLAMA_SPEC_CHAIN");
         const bool chain_requested = chain_env != nullptr && std::strcmp(chain_env, "0") != 0;
+        const char * sharded_head_env = std::getenv("LLAMA_SPEC_SHARDED_HEAD");
+        const bool sharded_head_requested = sharded_head_env != nullptr && std::strcmp(sharded_head_env, "0") != 0;
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -1887,9 +1890,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
         chain_graph   = chain_requested && !is_mem_shared && !chain_heads && n_seq == 1;
         chain_need_probability = this->params.p_min > 0.0f;
+        chain_sharded_head = sharded_head_requested;
+
+        if (chain_sharded_head && (!chain_graph || llama_model_tensor_parallel_size(llama_get_model(ctx_dft)) != 2)) {
+            throw std::runtime_error("LLAMA_SPEC_SHARDED_HEAD requires chained single-sequence TP2 MTP");
+        }
 
         if (chain_graph) {
             llama_set_mtp_chain_need_probability(ctx_dft, chain_need_probability);
+            llama_set_mtp_chain_sharded_head(ctx_dft, chain_sharded_head);
         }
 
         if (chain_heads) {

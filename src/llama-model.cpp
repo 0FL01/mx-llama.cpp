@@ -864,6 +864,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        static const bool shard_mtp_head = [] {
+            const char * env = getenv("LLAMA_SPEC_SHARDED_HEAD");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (shard_mtp_head && ud->model->arch == LLM_ARCH_QWEN35 && axis == 1 &&
+                std::regex_match(tensor_name, pattern_output_weight)) {
+            const char * env = getenv("LLAMA_SPEC_CHAIN_SUB");
+            const int64_t n_sub = env != nullptr ? std::atoll(env) : 32768;
+            GGML_ASSERT(n_sub > 0 && n_sub <= tensor->ne[axis]);
+            if (n_sub < tensor->ne[axis]) {
+                return {{n_sub, 1}, {tensor->ne[axis] - n_sub, 1}};
+            }
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
@@ -1076,8 +1089,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // everything else
-        GGML_ASSERT(segments.size() == 1);
-        return {1};
+        return std::vector<int64_t>(segments.size(), 1);
     };
 
     // Determine which TP stage owns this tensor. Layers map to stages contiguously
@@ -2350,6 +2362,12 @@ bool llama_model::tensor_mirror_output() const {
         const char * env = getenv("LLAMA_META_MIRROR_OUTPUT");
         return env != nullptr && atoi(env) != 0;
     }();
+    static const bool shard_mtp_head = [] {
+        const char * env = getenv("LLAMA_SPEC_SHARDED_HEAD");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    GGML_ASSERT(!(shard_mtp_head && (pimpl->tensor_mirror_output || force_mirror)) &&
+            "LLAMA_SPEC_SHARDED_HEAD is incompatible with output mirroring");
     return pimpl->tensor_mirror_output || force_mirror;
 }
 
@@ -3633,6 +3651,13 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
+}
+
+int32_t llama_model_tensor_parallel_size(const struct llama_model * model) {
+    if (model->split_mode() != LLAMA_SPLIT_MODE_TENSOR || model->get_split_state_ud.n_stages == 0) {
+        return 1;
+    }
+    return (int32_t) (model->get_split_state_ud.n_devices / model->get_split_state_ud.n_stages);
 }
 
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
