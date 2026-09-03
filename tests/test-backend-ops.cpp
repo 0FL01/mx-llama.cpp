@@ -2707,6 +2707,51 @@ struct test_argmax : public test_case {
     }
 };
 
+// GGML_OP_TP_TOP1_STATS + GGML_OP_TP_TOP1_SELECT
+struct test_tp_top1 : public test_case {
+    const bool need_probability;
+
+    std::string vars() override {
+        return VARS_TO_STR1(need_probability);
+    }
+
+    test_tp_top1(bool need_probability) : need_probability(need_probability) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+        ggml_tensor * a1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+
+        ggml_tensor * stats0 = ggml_tp_top1_stats(ctx, a0, 0, 2, 0, need_probability);
+        ggml_tensor * stats1 = ggml_tp_top1_stats(ctx, a1, 1, 2, 5, need_probability);
+        ggml_tensor * stats = ggml_add(ctx, stats0, stats1);
+        ggml_tensor * out = ggml_tp_top1_select(ctx, stats, 2, need_probability);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::array<float, 5> values0 = { 1.0f, 5.0f, 2.0f, 3.0f, 4.0f };
+        const std::array<float, 5> values1 = { 0.0f, 5.0f, 1.0f, 2.0f, 3.0f };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(ggml_get_name(t), "a0") == 0) {
+                ggml_backend_tensor_set(t, values0.data(), 0, sizeof(values0));
+            } else if (strcmp(ggml_get_name(t), "a1") == 0) {
+                ggml_backend_tensor_set(t, values1.data(), 0, sizeof(values1));
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return need_probability ? 1e-6 : 0.0;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+};
+
 // GGML_OP_COUNT_EQUAL
 struct test_count_equal : public test_case {
     const ggml_type type;
@@ -8798,6 +8843,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    test_cases.emplace_back(new test_tp_top1(false));
+    test_cases.emplace_back(new test_tp_top1(true));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));

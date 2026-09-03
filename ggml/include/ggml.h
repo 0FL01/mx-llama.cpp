@@ -590,6 +590,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_TP_TOP1_STATS,
+        GGML_OP_TP_TOP1_SELECT,
+
         GGML_OP_COUNT,
     };
 
@@ -1064,6 +1067,24 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // Per-rank top-1 statistics for tensor-parallel vocabulary logits.
+    // Returns 4*nranks F32 values: maxes, local sumexp, global ids, finite flags.
+    GGML_API struct ggml_tensor * ggml_tp_top1_stats(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               rank,
+            int32_t               nranks,
+            int32_t               global_offset,
+            bool                  need_probability);
+
+    // Selects the global top-1 from SUM-allreduced per-rank statistics.
+    // Returns two F32 values: global token id and probability/status.
+    GGML_API struct ggml_tensor * ggml_tp_top1_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * stats,
+            int32_t               nranks,
+            bool                  need_probability);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(

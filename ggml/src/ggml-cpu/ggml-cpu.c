@@ -1793,6 +1793,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argmax(params, tensor);
             } break;
+        case GGML_OP_TP_TOP1_STATS:
+            {
+                ggml_compute_forward_tp_top1_stats(params, tensor);
+            } break;
+        case GGML_OP_TP_TOP1_SELECT:
+            {
+                ggml_compute_forward_tp_top1_select(params, tensor);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 ggml_compute_forward_count_equal(params, tensor);
@@ -2250,6 +2258,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_TP_TOP1_STATS:
+        case GGML_OP_TP_TOP1_SELECT:
             {
                 n_tasks = 1;
             } break;

@@ -1098,9 +1098,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TP_TOP1_STATS",
+    "TP_TOP1_SELECT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1216,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "tp_top1_stats(x)",
+    "tp_top1_select(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2543,6 +2549,55 @@ struct ggml_tensor * ggml_argmax(
 
     result->op     = GGML_OP_ARGMAX;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_tp_top1_stats
+
+struct ggml_tensor * ggml_tp_top1_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               rank,
+        int32_t               nranks,
+        int32_t               global_offset,
+        bool                  need_probability) {
+    GGML_ASSERT(ggml_is_vector(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(rank >= 0 && rank < nranks);
+    GGML_ASSERT(nranks > 0 && nranks <= 16);
+    GGML_ASSERT(global_offset >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*nranks);
+
+    result->op     = GGML_OP_TP_TOP1_STATS;
+    result->src[0] = a;
+    ggml_set_op_params_i32(result, 0, rank);
+    ggml_set_op_params_i32(result, 1, nranks);
+    ggml_set_op_params_i32(result, 2, global_offset);
+    ggml_set_op_params_i32(result, 3, need_probability);
+
+    return result;
+}
+
+// ggml_tp_top1_select
+
+struct ggml_tensor * ggml_tp_top1_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * stats,
+        int32_t               nranks,
+        bool                  need_probability) {
+    GGML_ASSERT(ggml_is_vector(stats));
+    GGML_ASSERT(stats->type == GGML_TYPE_F32);
+    GGML_ASSERT(nranks > 0 && nranks <= 16);
+    GGML_ASSERT(stats->ne[0] == 4*nranks);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+
+    result->op     = GGML_OP_TP_TOP1_SELECT;
+    result->src[0] = stats;
+    ggml_set_op_params_i32(result, 0, nranks);
+    ggml_set_op_params_i32(result, 1, need_probability);
 
     return result;
 }

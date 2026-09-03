@@ -2802,6 +2802,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
+        case GGML_OP_TP_TOP1_STATS:
+            ggml_cuda_tp_top1_stats(ctx, dst);
+            break;
+        case GGML_OP_TP_TOP1_SELECT:
+            ggml_cuda_tp_top1_select(ctx, dst);
+            break;
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
             break;
@@ -6272,6 +6278,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_ARGMAX:
+        case GGML_OP_TP_TOP1_STATS:
+        case GGML_OP_TP_TOP1_SELECT:
         case GGML_OP_COUNT_EQUAL:
             {
                 return true;
