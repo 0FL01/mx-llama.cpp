@@ -1747,6 +1747,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    static constexpr int32_t  CHAIN_ADAPTIVE_SHORT_CONTEXT = 32768;
+    static constexpr uint32_t CHAIN_ADAPTIVE_EPOCH = 64;
+    static constexpr double   CHAIN_ADAPTIVE_MIN_ACCEPTANCE = 0.64;
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -1768,6 +1772,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    chain_graph            = false; // qwen35: all draft steps in one graph
     bool    chain_need_probability = false; // p_min filtering needs the top-token probability
     bool    chain_sharded_head      = false; // TP2 output head uses device-side global top-1
+    bool    chain_adaptive_depth    = false; // measured short-context policy, depth 3 -> 2 at most once
+
+    struct {
+        int32_t  depth          = 3;
+        int32_t  last_depth     = 0;
+        int32_t  prompt_tokens  = 0;
+        uint32_t samples        = 0;
+        uint32_t third_accepted = 0;
+        bool     short_context  = false;
+        bool     decided        = true;
+    } chain_adaptive;
+
+    size_t chain_depth_2_calls = 0;
+    size_t chain_depth_3_calls = 0;
+    size_t chain_depth_transitions = 0;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1866,6 +1885,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const bool chain_requested = chain_env != nullptr && std::strcmp(chain_env, "0") != 0;
         const char * sharded_head_env = std::getenv("LLAMA_SPEC_SHARDED_HEAD");
         const bool sharded_head_requested = sharded_head_env != nullptr && std::strcmp(sharded_head_env, "0") != 0;
+        const char * adaptive_depth_env = std::getenv("LLAMA_SPEC_CHAIN_ADAPTIVE");
+        const bool adaptive_depth_requested = adaptive_depth_env != nullptr && std::strcmp(adaptive_depth_env, "0") != 0;
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -1891,9 +1912,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         chain_graph   = chain_requested && !is_mem_shared && !chain_heads && n_seq == 1;
         chain_need_probability = this->params.p_min > 0.0f;
         chain_sharded_head = sharded_head_requested;
+        chain_adaptive_depth = adaptive_depth_requested;
 
         if (chain_sharded_head && (!chain_graph || llama_model_tensor_parallel_size(llama_get_model(ctx_dft)) != 2)) {
             throw std::runtime_error("LLAMA_SPEC_SHARDED_HEAD requires chained single-sequence TP2 MTP");
+        }
+        if (chain_adaptive_depth && (!chain_graph || this->params.n_max != 3 || chain_need_probability)) {
+            throw std::runtime_error("LLAMA_SPEC_CHAIN_ADAPTIVE requires chained single-sequence MTP with n_max=3 and p_min=0");
         }
 
         if (chain_graph) {
@@ -1976,6 +2001,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+        if (chain_adaptive_depth) {
+            GGML_ASSERT(seq_id == 0);
+            chain_adaptive = {};
+            chain_adaptive.prompt_tokens = N;
+            chain_adaptive.short_context = N < CHAIN_ADAPTIVE_SHORT_CONTEXT;
+            chain_adaptive.decided = !chain_adaptive.short_context;
         }
         if (adaptive_disable && seq_id >= 0 && seq_id < (llama_seq_id) disabled.size()) {
             disabled[seq_id] = false;
@@ -2259,6 +2291,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // Qwen35 chained drafting emits every proposal from one graph. Keep the
         // generic path for single-token tails and unsupported multi-sequence rounds.
         if (chain_graph) {
+            if (chain_adaptive_depth) {
+                chain_adaptive.last_depth = 0;
+            }
+
             llama_seq_id seq_one = -1;
             int n_seq_drafting = 0;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2273,6 +2309,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 int32_t n_chain = params.n_max;
+                if (chain_adaptive_depth) {
+                    n_chain = std::min(n_chain, chain_adaptive.depth);
+                }
                 if (dp.n_max > 0) {
                     n_chain = std::min(n_chain, dp.n_max);
                 }
@@ -2326,6 +2365,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                     if (result.size() < (size_t) params.n_min) {
                         result.clear();
+                    }
+                    if (chain_adaptive_depth) {
+                        chain_adaptive.last_depth = (int32_t) result.size();
+                        if (chain_adaptive.last_depth == 2) {
+                            ++chain_depth_2_calls;
+                        } else if (chain_adaptive.last_depth == 3) {
+                            ++chain_depth_3_calls;
+                        }
                     }
                     return;
                 }
@@ -2483,9 +2530,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (chain_adaptive_depth && !is_other) {
+            if (chain_adaptive.last_depth == 3 && chain_adaptive.short_context && !chain_adaptive.decided) {
+                ++chain_adaptive.samples;
+                chain_adaptive.third_accepted += n_accepted >= 3;
+
+                if (chain_adaptive.samples == CHAIN_ADAPTIVE_EPOCH) {
+                    const double rate = (double) chain_adaptive.third_accepted / chain_adaptive.samples;
+                    chain_adaptive.decided = true;
+                    if (rate < CHAIN_ADAPTIVE_MIN_ACCEPTANCE) {
+                        chain_adaptive.depth = 2;
+                        ++chain_depth_transitions;
+                        SPC_INF("adaptive chain depth 3 -> 2 at prompt=%d after %u rounds, third acceptance=%.3f\n",
+                                chain_adaptive.prompt_tokens, chain_adaptive.samples, rate);
+                    } else {
+                        SPC_INF("adaptive chain keeping depth 3 at prompt=%d after %u rounds, third acceptance=%.3f\n",
+                                chain_adaptive.prompt_tokens, chain_adaptive.samples, rate);
+                    }
+                }
+            }
+            chain_adaptive.last_depth = 0;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -3783,6 +3852,11 @@ void common_speculative_print_stats(const common_speculative * spec) {
             LOG_INF("statistics %16s: draft split sampler(host)=%.3f ms, model+sync+other=%.3f ms, sampler=%.2f%%\n",
                     common_speculative_type_to_str(impl->type).c_str(),
                     t_sampler_us / 1000.0, t_model_sync_us / 1000.0, sampler_share);
+            if (mtp->chain_adaptive_depth) {
+                LOG_INF("statistics %16s: adaptive chain depth calls n2=%zu, n3=%zu, transitions=%zu\n",
+                        common_speculative_type_to_str(impl->type).c_str(),
+                        mtp->chain_depth_2_calls, mtp->chain_depth_3_calls, mtp->chain_depth_transitions);
+            }
         }
     }
 }
