@@ -76,8 +76,10 @@ static inline bool ggml_cuda_fattn_tile_q4_0_native(const int device, const ggml
         K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         K->nb[0] == sizeof(block_q4_0) && V->nb[0] == sizeof(block_q4_0) &&
-        K->nb[1] == (K->ne[0]/QK4_0)*sizeof(block_q4_0) &&
-        V->nb[1] == (V->ne[0]/QK4_0)*sizeof(block_q4_0) &&
+        K->nb[1] >= (K->ne[0]/QK4_0)*sizeof(block_q4_0) && K->nb[1] % sizeof(block_q4_0) == 0 &&
+        V->nb[1] >= (V->ne[0]/QK4_0)*sizeof(block_q4_0) && V->nb[1] % sizeof(block_q4_0) == 0 &&
+        K->nb[2] >= (K->ne[0]/QK4_0)*sizeof(block_q4_0) && K->nb[2] % sizeof(block_q4_0) == 0 &&
+        V->nb[2] >= (V->ne[0]/QK4_0)*sizeof(block_q4_0) && V->nb[2] % sizeof(block_q4_0) == 0 &&
         max_bias == 0.0f && logit_softcap == 0.0f;
 #else
     GGML_UNUSED(device);
