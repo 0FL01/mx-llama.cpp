@@ -50,6 +50,42 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+static inline bool ggml_cuda_fattn_tile_q4_0_native(const int device, const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const char * env = getenv("GGML_CUDA_FATTN_Q4_NATIVE");
+    if (env == nullptr || env[0] != '1' || env[1] != '\0' ||
+            ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_VEGA20) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias;
+    float logit_softcap;
+    memcpy(&max_bias,       (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap,  (const float *) dst->op_params + 2, sizeof(float));
+
+    return Q != nullptr && K != nullptr && V != nullptr && mask != nullptr && dst->src[4] == nullptr &&
+        Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+        (Q->ne[1] == 3 || Q->ne[1] == 4) && Q->ne[2] == 6*K->ne[2] &&
+        Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+        K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        K->nb[0] == sizeof(block_q4_0) && V->nb[0] == sizeof(block_q4_0) &&
+        K->nb[1] == (K->ne[0]/QK4_0)*sizeof(block_q4_0) &&
+        V->nb[1] == (V->ne[0]/QK4_0)*sizeof(block_q4_0) &&
+        max_bias == 0.0f && logit_softcap == 0.0f;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
