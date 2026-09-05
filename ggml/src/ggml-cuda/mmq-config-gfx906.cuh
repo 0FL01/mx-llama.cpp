@@ -16,7 +16,7 @@
 // LDS tile, cutting VGPR/scratch and improving Q5_K/Q6_K throughput ~15-35%.
 // Q4_K stays at I=128 (I=64 makes it ~53% slower). J=64 only.
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_gfx906(ggml_type type, int J, bool fallback) {
-    if (type == GGML_TYPE_Q4_0) {
+    if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) {
         // Milpster's Vega table (468c164f4): the I=128 LDS footprint limits
         // residency to one block/CU. Do not constrain registers for two.
         ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
