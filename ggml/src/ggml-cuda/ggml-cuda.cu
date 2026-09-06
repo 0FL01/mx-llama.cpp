@@ -33,6 +33,7 @@
 #include "ggml-cuda/q8_repack/repack.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvdq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2591,6 +2592,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // H7-mmvdq experiment (ported from ggml-org/llama.cpp e9c355f39):
+    // dequantize-to-float matvec for K-quants, skipping the q8_1
+    // activation quantize pass. Arch default on for RDNA3.5 only;
+    // force on/off on gfx906 via GGML_CUDA_DQ_MMV / GGML_CUDA_DQ_Q6K.
+    // NOTE: the fused SwiGLU variant from e9c355f39 is NOT ported yet
+    // (our fuse site carries scales/biases variants - needs adaptation).
+    const bool dq_default = GGML_CUDA_CC_IS_RDNA3_5(cc);
+    if (ggml_cuda_dq_mmv_enabled(dq_default) && ne11 == 1
+            && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K
+                || (src0->type == GGML_TYPE_Q6_K && ggml_cuda_dq_q6k_enabled(dq_default)))
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && src0->ne[0] % QK_K == 0) {
+        if (src0->type == GGML_TYPE_Q4_K) {
+            ggml_cuda_mul_mat_vec_dq_q4_K(ctx, src0, src1, dst);
+        } else if (src0->type == GGML_TYPE_Q5_K) {
+            ggml_cuda_mul_mat_vec_dq_q5_K(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_vec_dq_q6_K(ctx, src0, src1, dst);
+        }
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -5482,9 +5504,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cgraph);
 #endif
 
-    static bool enable_graph_optimization = [] {
-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
+    static bool enable_graph_optimization = [cuda_ctx] {
+        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
+        if (env != nullptr) {
+            return atoi(env) == 1;
+        }
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        return GGML_CUDA_CC_IS_RDNA3_5(cc);
     }();
 
     if (!enable_graph_optimization) {
