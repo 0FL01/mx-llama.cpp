@@ -40,8 +40,10 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q5_K, 256, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q5_K, 256, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
 
-    CASE(GGML_TYPE_Q6_K, 256, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
-    CASE(GGML_TYPE_Q6_K, 256, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    // H6' experiment: 8 warps for Q6_K (I=64 keeps VGPR/scratch in check).
+    // Q8_0 already runs 512 threads here; Q4_K deliberately stays 256.
+    CASE(GGML_TYPE_Q6_K, 512, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_Q6_K, 512, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
 
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 }
