@@ -1630,6 +1630,16 @@ static void ggml_compute_forward_mul_mat_id(
 
                 assert(i02 >= 0 && i02 < n_as);
 
+                // Optional context-owned cache table and gate-only LRU observations.
+                if (dst->src[4]) {
+                    int64_t * observed = (int64_t *) dst->src[4]->data;
+                    observed[i02] = ++observed[n_as];
+                }
+                if (dst->src[3] && ((const int32_t *) dst->src[3]->data)[i02] != ggml_get_op_params_i32(dst, 0)) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }

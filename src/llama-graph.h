@@ -815,10 +815,14 @@ struct llm_graph_params {
     // arena change the packing so runtime graphs stop fitting the reserved plan and
     // every prefill chunk pays a re-reserve plus an all-backend synchronize.
     const std::vector<ggml_tensor *> * layer_inp_dev = nullptr;
+    struct llama_moe_cache * moe_cache = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (moe_cache != other.moe_cache) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -992,6 +996,7 @@ struct llm_graph_qkv {
 
 struct llm_graph_context {
     const llm_arch arch;
+    struct llama_moe_cache * moe_cache;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;

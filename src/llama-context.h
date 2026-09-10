@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moecache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -412,6 +413,8 @@ private:
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
+    std::unique_ptr<llama_moe_cache> moe_cache;
+    bool moe_cache_decode = true; // include small cache graphs during reservation
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 

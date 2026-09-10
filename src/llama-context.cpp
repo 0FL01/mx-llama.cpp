@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "llama-moecache.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -94,6 +96,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    moe_cache = llama_moe_cache::create(model, params.n_moe_cache_slots, params.n_moe_cache_inserts);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1784,6 +1788,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    moe_cache_decode = false;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2022,6 +2027,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    // A short tail of a prefill batch must still use the stock graph.
+    moe_cache_decode = batch_inp.n_tokens >= 1 && batch_inp.n_tokens <= 3;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2460,6 +2467,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // Both CPU observers and GPU slot readers must finish before eviction.
+    if (moe_cache && batch_inp.n_tokens <= 3) {
+        synchronize();
+        moe_cache->step();
+    }
 
     return 0;
 }
@@ -3077,6 +3090,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.layer_inp_dev =*/ &layer_inp_dev,
+        /*.moe_cache     =*/ moe_cache_decode ? moe_cache.get() : nullptr,
     };
 }
 
@@ -4217,6 +4231,8 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.n_moe_cache_slots           =*/ 0,
+        /*.n_moe_cache_inserts         =*/ 2,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
