@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 
 std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & model, int32_t slots, int32_t inserts,
@@ -17,6 +18,11 @@ std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & mod
     }
     auto cache = std::make_unique<llama_moe_cache>();
     cache->max_inserts = inserts;
+    cache->report_each_step = std::getenv("LLAMA_MOE_CACHE_STATS_EACH_STEP") != nullptr;
+    if (const char * policy = std::getenv("LLAMA_MOE_CACHE_POLICY")) {
+        if (std::strcmp(policy, "frequency") == 0) { cache->frequency_gated = true; }
+        else if (std::strcmp(policy, "ranked") != 0) { throw std::runtime_error("invalid LLAMA_MOE_CACHE_POLICY"); }
+    }
     const auto canonical_host = [](const ggml_tensor * t, ggml_backend_buffer_type_t host_buft) {
         return t && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
             ggml_is_contiguous(t) && t->ne[3] == 1 &&
@@ -95,6 +101,8 @@ std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & mod
     }
     LLAMA_LOG_INFO("moe-cache: %zu layers, %d slots/layer, %d inserts/step, %.1f MiB\n",
         cache->layers.size(), slots, inserts, bytes/1048576.0);
+    LLAMA_LOG_INFO("moe-cache: policy=%s (frequency: per-call presence, decay=32, min=2, margin=1)\n",
+        cache->frequency_gated ? "frequency" : "ranked");
     return cache;
 }
 
@@ -112,25 +120,59 @@ void llama_moe_cache::step() {
         auto * table = static_cast<int32_t *>(c.host_table->data);
         auto * observed = static_cast<int64_t *>(c.observations->data);
         if (observed[c.up_src->ne[2]] == c.processed_clock) { continue; }
+        if (c.frequency.empty()) {
+            c.frequency.assign(c.up_src->ne[2], 0);
+            c.admitted_at.assign(c.n_slots, 0);
+            c.used.assign(c.n_slots, false);
+        }
+        ++c.calls;
+        // Bound counters independently of total decode lifetime. Decay only on
+        // observed calls, never on prefill fallback or a repeated step().
+        if (c.calls % 32 == 0) {
+            for (auto & f : c.frequency) { f >>= 1; }
+        }
+        for (int32_t id = 0; id < c.up_src->ne[2]; ++id) {
+            if (observed[id] <= c.processed_clock) { continue; }
+            ++c.frequency[id];
+            const int slot = table[id];
+            if (slot < c.n_slots && !c.used[slot]) {
+                c.used[slot] = true;
+                ++c.first_hits;
+                c.first_hit_calls += c.calls - c.admitted_at[slot];
+            }
+        }
         std::vector<int32_t> pending;
         for (int32_t id = 0; id < c.up_src->ne[2]; ++id) {
             if (observed[id] > c.processed_clock && table[id] == c.n_slots) { pending.push_back(id); }
         }
-        std::sort(pending.begin(), pending.end(), [&](int32_t a, int32_t b) { return observed[a] > observed[b]; });
+        std::sort(pending.begin(), pending.end(), [&](int32_t a, int32_t b) {
+            if (frequency_gated && c.frequency[a] != c.frequency[b]) { return c.frequency[a] > c.frequency[b]; }
+            return observed[a] > observed[b];
+        });
         // Each expert occurs once in pending; all uploads finish within this step.
         int budget = max_inserts;
         bool changed = false;
         for (int32_t id : pending) {
+            if (frequency_gated && c.frequency[id] < 2) { continue; }
             if (budget-- <= 0) { break; }
             int slot = 0;
             for (int s = 0; s < c.n_slots; ++s) {
                 if (c.slot_expert[s] < 0) { slot = s; break; }
+                if (frequency_gated && c.frequency[c.slot_expert[s]] != c.frequency[c.slot_expert[slot]]) {
+                    if (c.frequency[c.slot_expert[s]] < c.frequency[c.slot_expert[slot]]) { slot = s; }
+                    continue;
+                }
                 if (observed[c.slot_expert[s]] < observed[c.slot_expert[slot]]) { slot = s; }
             }
             const int victim = c.slot_expert[slot];
             // Do not replace a more recently used expert, including earlier inserts.
-            if (victim >= 0 && observed[victim] >= observed[id]) { continue; }
-            if (victim >= 0) { table[victim] = c.n_slots; }
+            if (victim >= 0 && (frequency_gated ? c.frequency[id] <= c.frequency[victim] + 1 :
+                                                observed[victim] >= observed[id])) { continue; }
+            if (victim >= 0) {
+                table[victim] = c.n_slots;
+                ++c.evictions;
+                c.unused_evictions += !c.used[slot];
+            }
             const auto upload = [&](ggml_tensor * dst, const ggml_tensor * src) {
                 GGML_ASSERT(dst->nb[2] == src->nb[2]);
                 ggml_backend_tensor_set_async(c.backend, dst, static_cast<const char *>(src->data) + id*src->nb[2],
@@ -141,6 +183,9 @@ void llama_moe_cache::step() {
             upload(c.gate_c, c.gate_src);
             upload(c.down_c, c.down_src);
             c.slot_expert[slot] = id;
+            c.admitted_at[slot] = c.calls;
+            c.used[slot] = false;
+            ++c.admissions;
             table[id] = slot;
             changed = true;
         }
@@ -158,15 +203,29 @@ void llama_moe_cache::step() {
     // graph execution until every updated device has finished publishing slots.
     for (auto * backend : pending_backends) { ggml_backend_synchronize(backend); }
     update_us += ggml_time_us() - start_us;
-    if (++steps % 128 == 0) {
+    ++steps;
+    if (report_each_step || steps % 128 == 0) {
         int64_t routes = 0, hits = 0;
+        int64_t admissions = 0, evictions = 0, unused = 0, first_hits = 0, first_calls = 0, unhit = 0;
         for (const auto & c : layers) {
             const auto * observed = static_cast<const int64_t *>(c.observations->data);
             routes += observed[c.up_src->ne[2]];
             hits += observed[c.up_src->ne[2] + 1];
+            admissions += c.admissions;
+            evictions += c.evictions;
+            unused += c.unused_evictions;
+            first_hits += c.first_hits;
+            first_calls += c.first_hit_calls;
+            for (int s = 0; s < c.n_slots; ++s) {
+                unhit += c.slot_expert[s] >= 0 && !c.used[s];
+            }
         }
         LLAMA_LOG_INFO("moe-cache: steps=%lld hit=%.1f%% update=%.2f ms/step expert-upload=%.1f MiB/step\n",
             (long long) steps, 100.0*hits/std::max<int64_t>(routes, 1),
             update_us/(1000.0*steps), upload_bytes/(1048576.0*steps));
+        LLAMA_LOG_INFO("moe-cache: admissions=%lld evictions=%lld unused-evictions=%lld first-hits=%lld first-hit-calls=%.2f resident-unhit=%lld upload-bytes=%zu routes=%lld hits=%lld\n",
+            (long long) admissions, (long long) evictions, (long long) unused, (long long) first_hits,
+            double(first_calls)/std::max<int64_t>(first_hits, 1), (long long) unhit, upload_bytes,
+            (long long) routes, (long long) hits);
     }
 }

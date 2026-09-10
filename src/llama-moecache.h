@@ -23,6 +23,16 @@ struct llama_moe_cache_layer {
     ggml_tensor * observations;
     std::vector<int32_t> slot_expert;
     int64_t processed_clock = 0;
+    // Per-call presence, not token counts: observations collapse repeated IDs.
+    std::vector<uint32_t> frequency;
+    std::vector<int64_t> admitted_at;
+    std::vector<bool> used;
+    int64_t calls = 0;
+    int64_t admissions = 0;
+    int64_t evictions = 0;
+    int64_t unused_evictions = 0;
+    int64_t first_hits = 0;
+    int64_t first_hit_calls = 0;
 };
 
 struct llama_moe_cache {
@@ -33,6 +43,8 @@ struct llama_moe_cache {
     int64_t steps = 0;
     int64_t update_us = 0;
     size_t upload_bytes = 0;
+    bool frequency_gated = false; // opt-in diagnostic policy; ranked LRU is default
+    bool report_each_step = false;
 
     static std::unique_ptr<llama_moe_cache> create(const llama_model & model, int32_t slots, int32_t inserts,
                                                 const std::vector<ggml_backend_ptr> & backends);

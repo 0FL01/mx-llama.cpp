@@ -5,7 +5,7 @@
 #include <vector>
 
 // Optional device argument checks the same split on actual accelerator kernels.
-static void test_batch(int nt, ggml_type type, ggml_backend_t device) {
+static void test_batch(int nt, ggml_type type, ggml_backend_t device, bool frequency) {
     constexpr int width = 256;
     ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
     GGML_ASSERT(backend);
@@ -14,6 +14,7 @@ static void test_batch(int nt, ggml_type type, ggml_backend_t device) {
     if (set_threads) { set_threads(backend.get(), 2); }
     llama_moe_cache cache;
     cache.max_inserts = 2;
+    cache.frequency_gated = frequency;
     ggml_init_params ip = { 32*ggml_tensor_overhead(), nullptr, true };
     cache.contexts.emplace_back(ggml_init(ip));
     auto * ctx = cache.contexts.back().get();
@@ -130,17 +131,55 @@ static void test_batch(int nt, ggml_type type, ggml_backend_t device) {
         GGML_ASSERT(error / (norm + 1e-30) < (device ? 1e-4 : 1e-12));
         cache.step();
         const auto * table = static_cast<const int32_t *>(c.host_table->data);
-        GGML_ASSERT(table[round < 2 ? 0 : 2] < c.n_slots);
-        GGML_ASSERT(table[round < 2 ? 1 : 3] < c.n_slots);
-        GGML_ASSERT(table[round < 2 ? 2 : 0] == c.n_slots);
+        if (!frequency) {
+            GGML_ASSERT(table[round < 2 ? 0 : 2] < c.n_slots);
+            GGML_ASSERT(table[round < 2 ? 1 : 3] < c.n_slots);
+            GGML_ASSERT(table[round < 2 ? 2 : 0] == c.n_slots);
+        } else if (round == 0) {
+            for (int id = 0; id < 4; ++id) { GGML_ASSERT(table[id] == c.n_slots); }
+        } else if (round == 1) {
+            GGML_ASSERT(table[0] < c.n_slots && table[1] < c.n_slots && table[2] == c.n_slots);
+        } else if (round == 2) {
+            // Single new occurrence of expert3 cannot evict a repeated expert.
+            GGML_ASSERT(table[3] == c.n_slots);
+        }
         const auto old_slots = cache.layers[0].slot_expert;
+        const auto old_frequency = cache.layers[0].frequency;
+        const auto old_calls = cache.layers[0].calls;
         cache.step(); // no new observations: no churn
         GGML_ASSERT(old_slots == cache.layers[0].slot_expert);
+        GGML_ASSERT(old_frequency == cache.layers[0].frequency && old_calls == cache.layers[0].calls);
         for (auto * w : {c.up_c, c.gate_c, c.down_c}) {
             std::vector<char> dummy(w->nb[2]);
             ggml_backend_tensor_get(w, dummy.data(), c.n_slots*w->nb[2], w->nb[2]);
             for (char value : dummy) { GGML_ASSERT(value == 0); }
         }
+    }
+    if (frequency) {
+        auto & layer = cache.layers[0];
+        auto * observed = static_cast<int64_t *>(c.observations->data);
+        auto * table = static_cast<int32_t *>(c.host_table->data);
+        // A phase change must eventually admit expert3 despite the old hot set;
+        // repeated decay bounds every counter and cannot change empty steps.
+        for (int call = 0; call < 96; ++call) {
+            observed[3] = ++observed[4];
+            observed[5] += table[3] < c.n_slots;
+            const auto before = layer.admissions;
+            cache.step();
+            GGML_ASSERT(layer.admissions - before <= cache.max_inserts);
+            for (auto f : layer.frequency) { GGML_ASSERT(f <= 64); }
+        }
+        GGML_ASSERT(table[3] < c.n_slots && layer.frequency[3] >= 32);
+        int resident = 0, unhit = 0;
+        for (int slot = 0; slot < c.n_slots; ++slot) {
+            resident += layer.slot_expert[slot] >= 0;
+            unhit += layer.slot_expert[slot] >= 0 && !layer.used[slot];
+        }
+        GGML_ASSERT(layer.admissions == layer.evictions + resident);
+        GGML_ASSERT(layer.admissions == layer.first_hits + layer.unused_evictions + unhit);
+        std::vector<int32_t> device_table(4);
+        ggml_backend_tensor_get(c.dev_table, device_table.data(), 0, ggml_nbytes(c.dev_table));
+        for (int id = 0; id < 4; ++id) { GGML_ASSERT(table[id] == device_table[id]); }
     }
 }
 
@@ -152,7 +191,9 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(device);
     }
     for (auto type : {GGML_TYPE_F32, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0}) {
-        for (int nt = 1; nt <= 3; ++nt) { test_batch(nt, type, device.get()); }
+        for (int nt = 1; nt <= 3; ++nt) {
+            for (bool frequency : {false, true}) { test_batch(nt, type, device.get(), frequency); }
+        }
     }
-    puts("MoE cache: batches 1..3, cold/mixed/evicted splits and dummy slots passed");
+    puts("MoE cache: both policies, batches1..3, quant splits, admission/decay/phase-change/usage and dummy slots passed");
 }
