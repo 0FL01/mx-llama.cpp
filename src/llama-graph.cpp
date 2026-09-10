@@ -2212,6 +2212,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * mc_inp = cur;
+    if (mcache) {
+        // Stage the miss inputs before launching hits. Otherwise the CPU
+        // input copy synchronizes the device after its hit chain was queued.
+        cur = ggml_dup(ctx0, cur);
+        selected_experts = ggml_dup(ctx0, selected_experts);
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
+        ggml_build_forward_expand(gf, cur);
+        ggml_build_forward_expand(gf, selected_experts);
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2410,6 +2420,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
         cb(down_g, "ffn_moe_cache_down", il);
+        // Queue device hits before the independent, already-staged CPU misses.
+        ggml_build_forward_expand(gf, down_g);
 
         experts = ggml_add(ctx0, experts, down_g);
         cb(experts, "ffn_moe_cache_merged", il);

@@ -97,8 +97,6 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
-    moe_cache = llama_moe_cache::create(model, params.n_moe_cache_slots, params.n_moe_cache_inserts);
-
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -391,6 +389,8 @@ llama_context::llama_context(
                     ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
         }
     }
+
+    moe_cache = llama_moe_cache::create(model, params.n_moe_cache_slots, params.n_moe_cache_inserts, backends);
 
     // init the memory module
     if (!hparams.vocab_only) {

@@ -1625,17 +1625,25 @@ static void ggml_compute_forward_mul_mat_id(
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            // One token is equally recent: prefer its first (highest-ranked)
+            // routes when the cache cannot admit every selected expert.
+            if (dst->src[4]) {
+                ((int64_t *) dst->src[4]->data)[n_as] += n_ids;
+            }
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
 
                 // Optional context-owned cache table and gate-only LRU observations.
+                const bool cache_hit = dst->src[3] &&
+                    ((const int32_t *) dst->src[3]->data)[i02] != ggml_get_op_params_i32(dst, 0);
                 if (dst->src[4]) {
                     int64_t * observed = (int64_t *) dst->src[4]->data;
-                    observed[i02] = ++observed[n_as];
+                    observed[i02] = observed[n_as] - id;
+                    observed[n_as + 1] += cache_hit;
                 }
-                if (dst->src[3] && ((const int32_t *) dst->src[3]->data)[i02] != ggml_get_op_params_i32(dst, 0)) {
+                if (cache_hit) {
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
                     continue;
                 }

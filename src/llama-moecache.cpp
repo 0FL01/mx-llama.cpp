@@ -7,7 +7,8 @@
 #include <cstring>
 #include <stdexcept>
 
-std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & model, int32_t slots, int32_t inserts) {
+std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & model, int32_t slots, int32_t inserts,
+                                                     const std::vector<ggml_backend_ptr> & backends) {
     if (slots <= 0 || model.hparams.no_alloc) {
         return nullptr;
     }
@@ -40,6 +41,13 @@ std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & mod
         }
         llama_moe_cache_layer c = {};
         c.n_slots = slots;
+        for (const auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == device) {
+                c.backend = backend.get();
+                break;
+            }
+        }
+        if (!c.backend) { throw std::runtime_error("MoE cache device backend missing"); }
         c.up_src = l.ffn_up_exps;
         c.gate_src = l.ffn_gate_exps;
         c.down_src = l.ffn_down_exps;
@@ -59,7 +67,7 @@ std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & mod
         };
         auto * host = new_context();
         c.host_table = ggml_new_tensor_2d(host, GGML_TYPE_I32, 1, ne);
-        c.observations = ggml_new_tensor_1d(host, GGML_TYPE_I64, ne + 1);
+        c.observations = ggml_new_tensor_1d(host, GGML_TYPE_I64, ne + 2);
         alloc(host, ggml_backend_cpu_buffer_type());
         auto * dev = new_context();
         const auto companion = [&](const ggml_tensor * src) {
@@ -98,6 +106,8 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * up) co
 }
 
 void llama_moe_cache::step() {
+    const int64_t start_us = ggml_time_us();
+    std::vector<ggml_backend_t> pending_backends;
     for (auto & c : layers) {
         auto * table = static_cast<int32_t *>(c.host_table->data);
         auto * observed = static_cast<int64_t *>(c.observations->data);
@@ -107,8 +117,9 @@ void llama_moe_cache::step() {
             if (observed[id] > c.processed_clock && table[id] == c.n_slots) { pending.push_back(id); }
         }
         std::sort(pending.begin(), pending.end(), [&](int32_t a, int32_t b) { return observed[a] > observed[b]; });
-        // Each expert occurs once in pending; synchronous uploads have no in-flight state.
+        // Each expert occurs once in pending; all uploads finish within this step.
         int budget = max_inserts;
+        bool changed = false;
         for (int32_t id : pending) {
             if (budget-- <= 0) { break; }
             int slot = 0;
@@ -122,16 +133,40 @@ void llama_moe_cache::step() {
             if (victim >= 0) { table[victim] = c.n_slots; }
             const auto upload = [&](ggml_tensor * dst, const ggml_tensor * src) {
                 GGML_ASSERT(dst->nb[2] == src->nb[2]);
-                ggml_backend_tensor_set(dst, static_cast<const char *>(src->data) + id*src->nb[2],
+                ggml_backend_tensor_set_async(c.backend, dst, static_cast<const char *>(src->data) + id*src->nb[2],
                     slot*dst->nb[2], src->nb[2]);
+                upload_bytes += src->nb[2];
             };
             upload(c.up_c, c.up_src);
             upload(c.gate_c, c.gate_src);
             upload(c.down_c, c.down_src);
             c.slot_expert[slot] = id;
-            table[id] = slot; // publish only after all three blocking uploads finish
+            table[id] = slot;
+            changed = true;
         }
-        ggml_backend_tensor_set(c.dev_table, table, 0, ggml_nbytes(c.host_table));
+        if (changed) {
+            // Same stream orders the table after its three-tensor expert uploads.
+            // Host table storage remains unchanged until all copies complete below.
+            ggml_backend_tensor_set_async(c.backend, c.dev_table, table, 0, ggml_nbytes(c.host_table));
+            if (std::find(pending_backends.begin(), pending_backends.end(), c.backend) == pending_backends.end()) {
+                pending_backends.push_back(c.backend);
+            }
+        }
         c.processed_clock = observed[c.up_src->ne[2]];
+    }
+    // The caller already synchronized readers before eviction. Do not return to
+    // graph execution until every updated device has finished publishing slots.
+    for (auto * backend : pending_backends) { ggml_backend_synchronize(backend); }
+    update_us += ggml_time_us() - start_us;
+    if (++steps % 128 == 0) {
+        int64_t routes = 0, hits = 0;
+        for (const auto & c : layers) {
+            const auto * observed = static_cast<const int64_t *>(c.observations->data);
+            routes += observed[c.up_src->ne[2]];
+            hits += observed[c.up_src->ne[2] + 1];
+        }
+        LLAMA_LOG_INFO("moe-cache: steps=%lld hit=%.1f%% update=%.2f ms/step expert-upload=%.1f MiB/step\n",
+            (long long) steps, 100.0*hits/std::max<int64_t>(routes, 1),
+            update_us/(1000.0*steps), upload_bytes/(1048576.0*steps));
     }
 }
