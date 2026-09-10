@@ -1,6 +1,7 @@
 ARG BASE_IMAGE=mixa3607/llama.cpp-gfx906:b10808-rocm-7.14-mxxm-20260826041541-pre
+ARG BUILD_IMAGE=${BASE_IMAGE}
 
-FROM ${BASE_IMAGE} AS build
+FROM ${BUILD_IMAGE} AS build
 RUN pip3 install --no-cache-dir cmake
 COPY . /build/llamacpp
 WORKDIR /build/llamacpp

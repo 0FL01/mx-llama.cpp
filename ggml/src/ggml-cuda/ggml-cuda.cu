@@ -6434,7 +6434,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
-#ifndef GGML_CUDA_USE_CUB
+#if !defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP)
             // Above the 16384-column shared-memory bitonic limit the
             // hierarchical two-pass selection runs: per-segment bitonic top-k
             // plus a candidate merge of n_seg * k entries, valid while that
@@ -6445,6 +6445,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->ne[0] <= 16384 ||
                    ((op->src[0]->ne[0] + 16383)/16384) * op->ne[0] <= 16384;
 #else
+            // HIP uses radix selection when the hierarchical merge exceeds LDS.
             return true;
 #endif
         case GGML_OP_ARGSORT:
