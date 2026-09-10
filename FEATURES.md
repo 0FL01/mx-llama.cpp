@@ -159,6 +159,48 @@ throughput win depends on the split mode - under `-sm tensor` the multi-GPU veri
 costs more than the drafting saves, while `-sm layer` lands near parity - so measure
 on your own topology before enabling it.
 
+## Layer-split MoE expert cache (experimental)
+
+`--moe-expert-cache N` keeps hot host-resident experts in context-owned GPU
+slots on each layer's owning device; zero (the default) disables the cache.
+`--moe-expert-cache-inserts N` bounds admissions per layer per decode call
+(default 2), not per accepted output token. Ranked LRU serves hits on the GPU
+and misses on the CPU for supported 1-3-token SiLU expert graphs. Larger
+prefills retain the stock graph/scheduler, not necessarily CPU execution.
+Canonical CPU or pinned host weights remain authoritative. Readers finish
+before eviction; queued up/gate/down uploads finish before the next compute
+and the device remap is published after the weights. The zero dummy slot,
+strided routing IDs and batch sizes 1-3 are covered by `test-moe-cache`.
+
+On two 16 GiB gfx906 cards with Qwen3.8-Flash-Next UD-Q3_K_XL, DIO, layer split,
+target/draft q4_0 KV, MTP2 on ROCm1, context capacity 131072 and batch/ubatch1024,
+112 slots with 2 inserts and `GGML_CUDA_DISABLE_GRAPHS=1` was adopted on
+2026-09-10. Repeated synthetic code-generation windows of 512 output tokens
+at occupied contexts 16384/65536 gave 13.084/7.367 tok/s versus the resident15
+reference's 11.204/6.777 (+16.8%/+8.7%). These are harmonic means of four warm
+observations per variant/context, not a significance or general workload claim.
+Disabling graphs alone added about 3.0%/0.7%; ranked on/off output streams
+matched exactly in these runs, while resident/cache streams can differ.
+Full prefill was slower by 12.5%/9.0%, so this is a decode-throughput choice,
+not a claim of lower full-ingestion request latency. Fully occupied 128k
+context remains unqualified. Unset `GGML_CUDA_DISABLE_GRAPHS` to re-enable
+graphs; setting it to zero still disables them.
+
+MTP is retained: disabling it reduced measured warm TG by approximately
+30%/34% without reallocating the freed draft VRAM (the 64k no-MTP comparison
+has only one completed block). Streaming, cancellation of streaming requests,
+structured tool round-trip, 65562-token retrieval and forced all-reject
+speculation were checked on the retained MTP configuration. This does not
+imply immediate cancellation propagation for nonstream router requests.
+
+`LLAMA_MOE_CACHE_POLICY=frequency` is an optional diagnostic admission policy:
+decaying per-call expert presence counts, minimum two observations and a
+one-count margin over the victim. It is not acceptance-aware and is not the
+adopted policy. Ranked is the default (`LLAMA_MOE_CACHE_POLICY=ranked` also
+selects it explicitly). Admission/unused-eviction/first-hit/upload statistics
+are logged every 128 steps; `LLAMA_MOE_CACHE_STATS_EACH_STEP` enables detailed
+diagnostic logging and should be absent from normal timing/production runs.
+
 ## Shared-expert tensor-parallel split
 
 Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the
