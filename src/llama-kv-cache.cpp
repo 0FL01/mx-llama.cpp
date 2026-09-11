@@ -1841,52 +1841,29 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     llama_pos p_min = std::numeric_limits<llama_pos>::max();
     llama_pos p_max = std::numeric_limits<llama_pos>::min();
 
-    std::bitset<LLAMA_MAX_SEQ> seqs;
-
     for (uint32_t i = 0; i < n_tokens; ++i) {
         p_min = std::min(p_min, ubatch.pos[i]);
         p_max = std::max(p_max, ubatch.pos[i]);
     }
 
-    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-        seqs.set(ubatch.seq_id_unq[s]);
-    }
-
     const llama_pos w0 = p_min - (llama_pos) n;
 
-    // (seq_id, pos) -> token, for every cell that could be a predecessor of a ubatch token
-    std::unordered_map<uint64_t, llama_token> hist;
-
-    const auto key = [](llama_seq_id seq_id, llama_pos pos) {
-        return ((uint64_t) seq_id << 32) | (uint32_t) pos;
-    };
-
-    // handle M-RoPE gaps: multiple tokens share the same temporal pos
-    // TODO @ngxson : improve this in the future
-    std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
-    below.fill({ -1, LLAMA_TOKEN_NULL });
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
-            [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                if (pos >= w0) {
-                    hist[key(seq_id, pos)] = tok;
-                } else if (pos > below[seq_id].first) {
-                    below[seq_id] = { pos, tok };
-                }
-            });
-    }
-
-    // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
+    // Query maintained (position, cell) indices instead of rebuilding a history
+    // map by scanning every occupied cell. Keep the original tie rules across
+    // streams as well: first below the window, last inside the window.
     const auto lookup = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
-        for (llama_pos q = p; q >= w0; --q) {
-            const auto it = hist.find(key(seq_id, q));
-            if (it != hist.end()) {
-                return it->second;
+        llama_pos best = -1;
+        llama_token tok = LLAMA_TOKEN_NULL;
+        for (const auto & cells : v_cells) {
+            const auto idx = cells.seq_pos_cell_le(seq_id, std::min(p, p_max), w0);
+            if (idx < 0) { continue; }
+            const auto pos = cells.pos_get(idx);
+            if (pos > best || (pos == best && pos >= w0)) {
+                best = pos;
+                tok = cells.ext_get(idx).tok;
             }
         }
-        return below[seq_id].second;
+        return tok;
     };
 
     // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
