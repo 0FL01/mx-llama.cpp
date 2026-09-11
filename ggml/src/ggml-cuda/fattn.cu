@@ -528,6 +528,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
+            // gfx906-only: route MTP-verify batch3 with q4_0 KV to the existing
+            // vector path (2+1 tiling) instead of tile + full F16 conversion.
+            // All other vector guards above (head size, K stride, MMA/WMMA
+            // thresholds) still apply; numerical parity is gated by fixtures
+            // and exact on-workload output IDs.
+            if (Q->ne[1] == 3 && cc == GGML_CUDA_CC_VEGA20 &&
+                K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
         }
     }
     return BEST_FATTN_KERNEL_TILE;
