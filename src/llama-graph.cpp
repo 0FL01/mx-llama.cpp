@@ -21,6 +21,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -2396,6 +2397,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // activation above (the only type_op the cache path is enabled for)
         ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   mc_inp, mc_slot_ids);
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, mc_inp, mc_slot_ids);
+        // Opt-in permits a same-binary A/B without changing cache placement.
+        const char * dummy_env = std::getenv("LLAMA_MOE_CACHE_DUMMY_SKIP");
+        const bool skip_dummy = dummy_env && std::strcmp(dummy_env, "1") == 0;
+        // Companion allocation clears the dummy slot; admission only writes slots below n_slots.
+        if (skip_dummy) {
+            ggml_mul_mat_id_set_cache_dummy(up_g,   mcache->n_slots);
+            ggml_mul_mat_id_set_cache_dummy(gate_g, mcache->n_slots);
+        }
         cb(up_g,   "ffn_moe_cache_up",   il);
         cb(gate_g, "ffn_moe_cache_gate", il);
 
@@ -2419,6 +2428,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
+        if (skip_dummy) { ggml_mul_mat_id_set_cache_dummy(down_g, mcache->n_slots); }
         cb(down_g, "ffn_moe_cache_down", il);
         // Queue device hits before the independent, already-staged CPU misses.
         ggml_build_forward_expand(gf, down_g);

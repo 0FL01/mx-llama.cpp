@@ -3407,6 +3407,18 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_cache_dummy(struct ggml_tensor * a, int32_t dummy_id) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID && a->src[3] == NULL);
+    GGML_ASSERT(dummy_id >= -1 && dummy_id < INT32_MAX && dummy_id < a->src[0]->ne[2]);
+    // Slot 0 and src[3] belong to the CPU cache hit-skip path.
+    ggml_set_op_params_i32(a, 1, dummy_id + 1);
+}
+
+int32_t ggml_mul_mat_id_get_cache_dummy(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    return ggml_get_op_params_i32(a, 1) - 1;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

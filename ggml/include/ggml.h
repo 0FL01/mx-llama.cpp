@@ -1472,6 +1472,11 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // Cache-only hint: the caller must keep this expert's weights exactly zero for the graph lifetime.
+    // Set -1 to disable (the default). Backends may ignore the hint. Fused operations need separate guarantees.
+    GGML_API void ggml_mul_mat_id_set_cache_dummy(struct ggml_tensor * a, int32_t dummy_id);
+    GGML_API int32_t ggml_mul_mat_id_get_cache_dummy(const struct ggml_tensor * a);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

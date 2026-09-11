@@ -1785,6 +1785,7 @@ struct ggml_cuda_mm_fusion_args_device {
     float x_scale_scalar = 1.0f;
     bool  use_x_scale_scalar = false;
     ggml_glu_op glu_op;
+    int32_t cache_dummy_id = -1;
 };
 
 struct ggml_cuda_kernel_launch_params {
