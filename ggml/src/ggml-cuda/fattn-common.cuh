@@ -1220,6 +1220,18 @@ void launch_fattn(
         blocks_num.y = parallel_blocks;
     }
 
+    // Diagnostic-only launch trace, disabled unless LLAMA_FA_DISPATCH_LOG is set. Do not ship in timing builds.
+    {
+        static const bool log_on = getenv("LLAMA_FA_DISPATCH_LOG") != nullptr;
+        if (log_on) {
+            const size_t conv_K = (need_f16_K && K->type != GGML_TYPE_F16) ? ggml_nelements(K) : 0;
+            const size_t conv_V = (need_f16_V && V->type != GGML_TYPE_F16) ? ggml_nelements(V) : 0;
+            fprintf(stderr, "FA_LAUNCH dev=%d name=%s Qn=%lld Kn=%lld tiles_dst=%d pblocks=%d blocks=[%u,%u,%u] stream_k=%d convK=%zu convV=%zu\n",
+                id, KQV->name, (long long) Q->ne[1], (long long) K->ne[1], ntiles_dst, parallel_blocks,
+                blocks_num.x, blocks_num.y, blocks_num.z, (int) stream_k, conv_K, conv_V);
+        }
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;

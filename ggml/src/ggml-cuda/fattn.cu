@@ -569,7 +569,24 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    // Diagnostic-only dispatch trace, disabled unless LLAMA_FA_DISPATCH_LOG is set. Do not ship in timing builds.
+    {
+        static const bool log_on = getenv("LLAMA_FA_DISPATCH_LOG") != nullptr;
+        if (log_on) {
+            const ggml_tensor * Q = dst->src[0];
+            const ggml_tensor * K = dst->src[1];
+            const ggml_tensor * V = dst->src[2];
+            const ggml_tensor * mask = dst->src[3];
+            fprintf(stderr, "FA_DISPATCH dev=%d name=%s Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld](%s) V=[%lld](%s) mask_n=%d kernel=%d\n",
+                ggml_cuda_get_device(), dst->name,
+                (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+                (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], ggml_type_name(K->type),
+                (long long) V->ne[0], ggml_type_name(V->type),
+                mask ? (int) mask->ne[1] : -1, (int) kernel);
+        }
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
