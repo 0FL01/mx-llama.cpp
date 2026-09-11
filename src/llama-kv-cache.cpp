@@ -63,6 +63,11 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// Custom indexer layout only. Bit 2 marks the absent V section.
+static constexpr uint32_t STATE_INDEXER_NO_V = 1u << 2;
+// Legacy readers cast v_trans to bool. Tag the checked layer count too, so transposed readers also reject.
+static constexpr uint32_t STATE_INDEXER_NO_V_LAYERS = 1u << 31;
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -80,12 +85,15 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
-    model(model), hparams(hparams), v_trans(v_trans),
+             const char *   name_tag,
+                     bool   indexer_no_v) :
+    model(model), hparams(hparams), v_trans(v_trans), indexer_no_v(indexer_no_v),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    GGML_ASSERT(!indexer_no_v || (!model.hparams.is_mla() && hparams.is_mla() && !other && !share));
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -2254,10 +2262,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
     const auto & cells = v_cells[cr.strm];
 
-    const uint32_t v_trans = this->v_trans ? 1 : 0;
-    const uint32_t n_layer = layers.size();
+    const uint32_t v_layout = (v_trans ? 1u : 0u) | (indexer_no_v ? STATE_INDEXER_NO_V : 0u);
+    const uint32_t n_layer = layers.size() | (indexer_no_v ? STATE_INDEXER_NO_V_LAYERS : 0u);
 
-    io.write(&v_trans, sizeof(v_trans));
+    io.write(&v_layout, sizeof(v_layout));
     io.write(&n_layer, sizeof(n_layer));
 
     // Iterate and write all the keys first, each row is a cell
@@ -2510,24 +2518,23 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
-    uint32_t v_trans;
+    uint32_t v_layout;
     uint32_t n_layer;
 
-    io.read(&v_trans, sizeof(v_trans));
+    io.read(&v_layout, sizeof(v_layout));
     io.read(&n_layer, sizeof(n_layer));
 
-    if (n_layer != layers.size()) {
-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
+    const uint32_t expected_layout = (v_trans ? 1u : 0u) | (indexer_no_v ? STATE_INDEXER_NO_V : 0u);
+    const uint32_t expected_layers = layers.size() | (indexer_no_v ? STATE_INDEXER_NO_V_LAYERS : 0u);
+
+    if (v_layout != expected_layout || n_layer != expected_layers) {
+        LLAMA_LOG_ERROR("%s: incompatible KV layout or layer count (0x%x/%u instead of 0x%x/%u)\n",
+                __func__, v_layout, n_layer, expected_layout, expected_layers);
         return false;
     }
 
     if (cell_count > cells.size()) {
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, cells.size());
-        return false;
-    }
-
-    if (this->v_trans != (bool) v_trans) {
-        LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
         return false;
     }
 

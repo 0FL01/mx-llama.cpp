@@ -114,7 +114,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+                         bool   indexer_no_v = false);
 
     ~llama_kv_cache() = default;
 
@@ -260,6 +261,7 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+    const bool indexer_no_v;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

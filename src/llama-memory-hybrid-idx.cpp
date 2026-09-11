@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 
@@ -46,16 +48,25 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+        const char * env_no_v = std::getenv("LLAMA_INDEXER_NO_V");
+        const bool indexer_no_v = env_no_v && std::strcmp(env_no_v, "1") == 0 && !model.hparams.is_mla();
+
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+
+        if (indexer_no_v) {
+            // Only the private indexer cache uses MLA allocation to omit its unused V.
+            hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+            hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+        }
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", indexer_no_v);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
