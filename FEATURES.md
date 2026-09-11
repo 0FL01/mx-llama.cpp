@@ -269,6 +269,27 @@ Thus host-resident weights do not imply CPU prefill, and layer split does not
 guarantee balanced expert prefill. These scoped traces do not quantify peer
 activation transfers or justify blindly importing another staging engine.
 
+## Unused indexer V removal
+
+`LLAMA_INDEXER_NO_V=1` omits only the private QSA indexer V cache, which has
+no consumer; real attention K/V and the indexer K layout are unchanged. This
+ports the two indexer MLA dimensions from upstream #28330 without its
+ancestral rope-type line. The serializer tags the custom layout in both the
+V word and the checked layer count, so old and new readers reject each
+other's incompatible indexer payloads before reading K/V data.
+
+Qualified on 2026-09-11 over ranked112/2, graphs-off, PLE, dummy-skip and MTP2:
+13 unused q4_0 V roots removed (12 target layers plus one draft), 234 logical
+MiB (108 on ROCm0, 126 on ROCm1); actual aligned buffers shrink 245370112
+bytes including verified HIP row padding. All remaining indexer K and real
+attention metadata, shapes and owning buffers match exactly. Live pooled
+keys/TOP_K/logits matched bit-identically across 100 canonical tensors each
+for 16k cold, prefix reuse and same-mode slot restore; same-mode
+save/erase/restore round-trips are whole-file identical (274710676 vs
+246379972 bytes) and cross-version restores are rejected. Streaming, cancel,
+tools, 64k retrieval, forced-all-reject and normal MTP restoration passed.
+This is a memory-only change with no throughput claim.
+
 ## Shared-expert tensor-parallel split
 
 Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the
