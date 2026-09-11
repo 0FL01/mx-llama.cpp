@@ -224,6 +224,51 @@ retained. A transient full-swap episode in one model load preceded PLE index
 allocation; it is recorded as a loading issue, not evidence that driver memory
 release is fixed. These results do not qualify fully occupied 128k context.
 
+## Explicit dummy-aware MoE MMVQ
+
+`LLAMA_MOE_CACHE_DUMMY_SKIP=1` marks only the cache graph's immutable zero
+expert. Both single-token and multi-token quantized MMVQ skip its weight
+loads/dots while preserving zero output writes, reductions and barriers.
+Unmarked experts, F32/other dispatch and unproven fused bias/gate epilogues
+retain the original computation. Admission, remapping, uploads and launch
+counts are unchanged; this is not a global "last expert is dummy" convention.
+
+On the same two gfx906, ranked112/2, graphs-off, PLE and MTP2 setup above,
+three paired blocks (36 requests, identical corresponding output IDs) gave
+13.359 to 13.610 tok/s at16k (+1.88%) and7.769 to7.890 at64k (+1.56%) with
+only this switch changed in the same binary. The primary16k gain was positive
+in every pair. This is an approximately2% incremental result, not a claim of
+>=2.000% or statistical significance. A separate fresh whole-image check
+against accepted PLE gave +1.38%/+1.11%; it is only one pair. Do not add gains
+from different experiment series. Streaming/cancel/tools/long retrieval and
+forced-all-reject passed; normal MTP is retained.
+
+A separate synchronized diagnostic confirmed identical routing/acceptance,
+uploaded bytes and8160 kernel launches, with4896 eligible cache MMVQ calls
+and19.705% dummy positions. Summed MMVQ/preparation event time fell7.64%;
+intrusive event waits do not measure whole-FFN critical-path latency. Initial
+route instrumentation read too early on a different stream; corrected data
+synchronizes the actual producer backend before readback.
+
+`test-dummy-mmvq` covers both GPUs, batches1-3, strided/repeated IDs, nonfinal
+dummy IDs, all/mixed hits, fused fallbacks and actual inventory quants
+IQ3_XXS/IQ4_NL/IQ4_XS/Q8_0 plus F32/Q4_0/IQ3_S. It also exposed an existing
+single-token odd-row MMVQ overwrite: the row bound must use the expert channel
+stride, not the token stride. That independent fix is in both A/B arms; this
+model's640/2560-row experts are even, so it is not credited with this speedup.
+
+### Measured prefill placement (diagnosis, not a staging implementation)
+
+For the fixed16384-token input,15 batches of1024 plus one of1020 execute all
+2304 expert matmuls as MMQ on ROCm0, selected by the existing host-weight
+offload priority. The final4-token batch executes144 expert matmuls on CPU:
+GPU support is true but offload policy declines that small shape. Large-batch
+expert transfers total444650950144 bytes over256899 copies, including
+131065344 bytes of padding; selected experts are already grouped into runs.
+Thus host-resident weights do not imply CPU prefill, and layer split does not
+guarantee balanced expert prefill. These scoped traces do not quantify peer
+activation transfers or justify blindly importing another staging engine.
+
 ## Shared-expert tensor-parallel split
 
 Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the
