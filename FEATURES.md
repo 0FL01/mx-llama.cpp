@@ -201,6 +201,29 @@ selects it explicitly). Admission/unused-eviction/first-hit/upload statistics
 are logged every 128 steps; `LLAMA_MOE_CACHE_STATS_EACH_STEP` enables detailed
 diagnostic logging and should be absent from normal timing/production runs.
 
+## Indexed PLE history
+
+The KV cell sequence index stores `(position, cell)` pairs, so PLE predecessor
+tokens no longer require a scan of every occupied cell and a temporary history
+map on each call. This adapts upstream #28040 while preserving the previous
+duplicate-position rules: first cell below the history window, last cell within
+it, including the original ordering across streams. PLE table placement and
+hash arithmetic are unchanged. `test-ple-history` compares the real lookup with
+the old scan through gaps, duplicates, sequence mutations, cell restore and
+accepted-prefix lengths 0-2.
+
+Qualified on 2026-09-11 over the ranked112/graphs-off/MTP2 setup above, with
+unchanged exact 16k/64k prompts and 512-token output windows in A/B/B/A blocks:
+warm TG 13.033 -> 13.395 tok/s (+2.78%) at 16k and 7.330 -> 7.828 (+6.80%) at
+64k. All compared output IDs matched; PP remained approximately 97.3/505-506 s.
+A separate instrumented 64k request measured target lookup mean 18.227 ms ->
+2.499 us per decode call, with identical predecessor hashes, call shapes and
+expert-upload counters. Those instrumented timings are not throughput samples.
+Streaming/cancel/tools, long retrieval and forced-all-reject passed with MTP
+retained. A transient full-swap episode in one model load preceded PLE index
+allocation; it is recorded as a loading issue, not evidence that driver memory
+release is fixed. These results do not qualify fully occupied 128k context.
+
 ## Shared-expert tensor-parallel split
 
 Under `-sm tensor` the DeepSeek shared expert was mirrored: every lane read the
