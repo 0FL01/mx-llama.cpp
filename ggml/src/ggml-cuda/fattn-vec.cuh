@@ -1,6 +1,15 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+// R2 diagnostic: count (query-row, KV-position) pairs processed by the vector
+// FA path and how many carry an exact -inf mask. Hardcoded ON in this diag
+// image only; timing from this image is never used for decisions. One print
+// per kernel launch from its last-finishing block; per-device aggregation is
+// NOT separated (both GPUs share one log), decode is serialized per stream.
+__device__ unsigned long long fa_hist_tot = 0;
+__device__ unsigned long long fa_hist_msk = 0;
+__device__ unsigned long long fa_hist_fin = 0;
+
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
@@ -252,6 +261,7 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    unsigned fa_ltot = 0, fa_lmsk = 0; // R2 diagnostic: pairs seen / -inf masked by this thread
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
@@ -283,6 +293,9 @@ static __global__ void flash_attn_ext_vec(
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*s31 + i_KQ]);
+                    // R2 diagnostic: exact -inf on the raw half, valid rows only.
+                    ++fa_ltot;
+                    fa_lmsk += (__half2float(maskh[j*s31 + i_KQ]) == -INFINITY);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -516,6 +529,17 @@ static __global__ void flash_attn_ext_vec(
 
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+    }
+    // R2 diagnostic: one atomic per thread, one print per launch (cumulative).
+    if (fa_ltot) {
+        atomicAdd(&fa_hist_tot, (unsigned long long) fa_ltot);
+        atomicAdd(&fa_hist_msk, (unsigned long long) fa_lmsk);
+    }
+    __threadfence();
+    if (atomicAdd(&fa_hist_fin, 1ULL) == (unsigned long long) gridDim.x*gridDim.y*gridDim.z - 1) {
+        printf("FA_HIST q=%d kv=%d ncols=%d tot=%llu msk=%llu\n",
+            (int) ne01.z, (int) ne11, ncols,
+            (unsigned long long) fa_hist_tot, (unsigned long long) fa_hist_msk);
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
