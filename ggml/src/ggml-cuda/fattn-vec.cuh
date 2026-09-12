@@ -4,11 +4,8 @@
 // R2 diagnostic: count (query-row, KV-position) pairs processed by the vector
 // FA path and how many carry an exact -inf mask. Hardcoded ON in this diag
 // image only; timing from this image is never used for decisions. One print
-// per kernel launch from its last-finishing block; per-device aggregation is
-// NOT separated (both GPUs share one log), decode is serialized per stream.
-__device__ unsigned long long fa_hist_tot = 0;
-__device__ unsigned long long fa_hist_msk = 0;
-__device__ unsigned long long fa_hist_fin = 0;
+// per thread-block with block-aggregated counts (no cross-block sync);
+// per-device aggregation is NOT separated (both GPUs share one log).
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -530,16 +527,19 @@ static __global__ void flash_attn_ext_vec(
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
-    // R2 diagnostic: one atomic per thread, one print per launch (cumulative).
-    if (fa_ltot) {
-        atomicAdd(&fa_hist_tot, (unsigned long long) fa_ltot);
-        atomicAdd(&fa_hist_msk, (unsigned long long) fa_lmsk);
-    }
-    __threadfence();
-    if (atomicAdd(&fa_hist_fin, 1ULL) == (unsigned long long) gridDim.x*gridDim.y*gridDim.z - 1) {
-        printf("FA_HIST q=%d kv=%d ncols=%d tot=%llu msk=%llu\n",
-            (int) ne01.z, (int) ne11, ncols,
-            (unsigned long long) fa_hist_tot, (unsigned long long) fa_hist_msk);
+    // R2 diagnostic: block-level reduction, one print per block. No atomics,
+    // no cross-block sync; offline sums group by (q, kv). tid < 128 by launch bounds.
+    __shared__ unsigned fa_hist_stot[128];
+    __shared__ unsigned fa_hist_smsk[128];
+    fa_hist_stot[tid] = fa_ltot;
+    fa_hist_smsk[tid] = fa_lmsk;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned btot = 0, bmsk = 0;
+        for (int i = 0; i < 128; ++i) { btot += fa_hist_stot[i]; bmsk += fa_hist_smsk[i]; }
+        if (btot) {
+            printf("FA_HISTB q=%d kv=%d ncols=%d tot=%u msk=%u\n", (int) ne01.z, (int) ne11, ncols, btot, bmsk);
+        }
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
