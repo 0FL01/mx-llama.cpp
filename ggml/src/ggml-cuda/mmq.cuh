@@ -220,10 +220,11 @@ struct ggml_cuda_mmq_config {
 
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
+#include "mmq-config-gcn.cuh"
 #include "mmq-config-rdna3.cuh"
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
-#include "mmq-config-gfx906.cuh" // gfx906 wraps rdna2, must be included after it
+#include "mmq-config-gfx906.cuh" // gfx906 wraps rdna2/gcn, must be included after both
 
 #undef CASE
 

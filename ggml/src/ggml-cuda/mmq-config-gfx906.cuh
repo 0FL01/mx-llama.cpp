@@ -1,7 +1,8 @@
 // gfx906 (Vega20 / MI50, wave64) MMQ config.
 //
-// Perf-only knobs (nthreads / tile widths) - results are bit-exact vs rdna2,
-// which is what upstream routes gfx906 through. Include after mmq-config-rdna2.cuh.
+// Perf-only knobs (nthreads / tile widths). Keep the measured MI50-specific
+// overrides below; all other formats inherit upstream's wave64 GCN table.
+// Include after mmq-config-rdna2.cuh and mmq-config-gcn.cuh.
 //
 // Q8_0: 8 warps (nthreads 512, vs rdna2's 4 = 256), and offer tile widths up to
 // J=128 (rdna2 caps its Q8_0 table at 64). The wide tiles are only SELECTED when
@@ -43,5 +44,13 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q6_K, 256, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q6_K, 256, 2, 64, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
 
-    return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
+    // Preserve the fork's measured MI50 behavior for K-quants where only
+    // selected tile widths have explicit gfx906 overrides above.
+    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
+        return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
+    }
+
+    // Everything else (notably Q2_0 and IQ types) inherits upstream's
+    // wave64-specific GCN tuning rather than the RDNA2/wave32-oriented table.
+    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
 }
