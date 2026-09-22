@@ -578,6 +578,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -646,6 +647,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -690,6 +692,8 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        // no file path: an externally supplied file pointer cannot be reopened
+        // per-thread; parallel loading is disabled for such models
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1523,6 +1527,25 @@ bool llama_model_loader::load_all_data(
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
+    // Thread-local file handles to avoid seek/read races when loading multiple
+    // contexts in parallel. Externally supplied file pointers (no recorded path)
+    // fall back to the shared handle: those models load sequentially.
+    thread_local std::unordered_map<std::string, std::unique_ptr<llama_file>> local_files;
+    auto get_local_file = [this](size_t idx) -> llama_file * {
+        if (idx >= file_paths.size() || file_paths.at(idx).empty()) {
+            return files.at(idx).get();
+        }
+        const std::string key = file_paths.at(idx) + (use_direct_io ? "#dio1" : "#dio0");
+        auto it = local_files.find(key);
+        if (it == local_files.end()) {
+            auto local_file = std::make_unique<llama_file>(file_paths.at(idx).c_str(), "rb", use_direct_io);
+            auto * ptr = local_file.get();
+            local_files.emplace(key, std::move(local_file));
+            return ptr;
+        }
+        return it->second.get();
+    };
+
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
@@ -1637,7 +1660,7 @@ bool llama_model_loader::load_all_data(
         }
 
         if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            if (!progress_callback((float) size_done.load(std::memory_order_relaxed) / size_data, progress_callback_user_data)) {
                 return false;
             }
         }
@@ -1661,24 +1684,27 @@ bool llama_model_loader::load_all_data(
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
-                if (lmlocks) {
-                    const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
-                }
+                {
+                    std::lock_guard<std::mutex> lock(mmaps_used_mutex);
+                    if (lmlocks) {
+                        const auto & lmlock = lmlocks->at(weight->idx);
+                        lmlock->grow_to(weight->offs + n_size);
+                    }
 
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
-            const auto & file = files.at(weight->idx);
+            llama_file * file = get_local_file(weight->idx);
 
             if (lazy_tensor_addr(ggml_get_name(cur)) == cur->data) {
                 // already bound to the file mapping, reading it back would fault in
                 // every page the lazy path exists to leave untouched
-                size_done += n_size;
+                size_done.fetch_add(n_size, std::memory_order_relaxed);
                 continue;
             }
             if (ggml_backend_buffer_is_host(cur->buffer)) {
@@ -1755,7 +1781,9 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        size_done += n_size;
+        // release: pairs with the cleanup acquire below so mmaps_used updates
+        // from this thread are visible to whichever thread runs final cleanup
+        size_done.fetch_add(n_size, std::memory_order_acq_rel);
     }
 
     // free temporary resources used for async uploads
@@ -1782,7 +1810,15 @@ bool llama_model_loader::load_all_data(
     }
 
     // check if this is the last call and do final cleanup
-    if (size_done >= size_data) {
+    if (size_done.load(std::memory_order_relaxed) >= size_data) {
+        // under parallel loading several threads can reach the totals at once;
+        // only one may run the shared-resource cleanup. The acquire of the CAS
+        // pairs with the per-tensor release fetch_add above.
+        bool expected = false;
+        if (!final_cleanup_done.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return true;
+        }
+
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

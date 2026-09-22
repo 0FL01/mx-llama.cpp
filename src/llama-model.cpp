@@ -26,12 +26,14 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -2267,9 +2269,63 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    const int32_t limit_val = params.n_parallel_load;
+    const size_t n_contexts = ctx_buf_maps.size();
+    const size_t parallel_limit = limit_val <= 0 ? n_contexts : (size_t) limit_val;
+    // parallel loading needs reopenable per-thread file handles; models supplied
+    // through an external file pointer keep the sequential path
+    const bool use_parallel = n_contexts > 1 && parallel_limit > 1 && ml.file_paths.size() == ml.files.size();
+
+    if (use_parallel) {
+        LLAMA_LOG_INFO("%s: loading %zu backend contexts in parallel (limit %zu)\n", __func__, n_contexts, parallel_limit);
+
+        std::atomic<bool> load_failed{false};
+        std::vector<std::future<bool>> futures;
+        futures.reserve(std::min(parallel_limit, n_contexts));
+
+        // sliding window of at most parallel_limit concurrent load_all_data jobs;
+        // each job reopens the model files privately and uploads to its own context.
+        // The progress callback is dropped here: it is not safe to invoke from
+        // several loader threads at once.
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (futures.size() >= parallel_limit) {
+                if (!futures.front().get()) {
+                    load_failed.store(true, std::memory_order_relaxed);
+                }
+                futures.erase(futures.begin());
+            }
+
+            auto * ctx_ptr = ctx;
+            auto * buf_map_ptr = &buf_map;
+            auto * mlock_ptr = use_mlock ? &pimpl->mlock_mmaps : nullptr;
+
+            futures.emplace_back(std::async(std::launch::async, [&ml, ctx_ptr, buf_map_ptr, mlock_ptr, &load_failed]() {
+                if (load_failed.load(std::memory_order_relaxed)) {
+                    return false;
+                }
+                return ml.load_all_data(
+                    ctx_ptr,
+                    *buf_map_ptr,
+                    mlock_ptr,
+                    nullptr,
+                    nullptr);
+            }));
+        }
+
+        for (auto & future : futures) {
+            if (!future.get()) {
+                load_failed.store(true, std::memory_order_relaxed);
+            }
+        }
+
+        if (load_failed.load(std::memory_order_relaxed)) {
             return false;
+        }
+    } else {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
         }
     }
 
@@ -3225,6 +3281,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.tensor_parallel_size        =*/ 0,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.n_parallel_load             =*/ -1,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
