@@ -326,6 +326,9 @@ extern "C" {
         int32_t tensor_parallel_size;
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        // max parallel jobs for model loading (-1 = all backend contexts, 1 = sequential)
+        int32_t n_parallel_load;
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 

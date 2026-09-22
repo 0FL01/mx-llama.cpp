@@ -2850,6 +2850,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"-pl", "--parallel-load"}, "N",
+        "max parallel jobs for model loading (default: all GPUs, 1 = sequential)",
+        [](common_params & params, int value) {
+            params.n_parallel_load = value;
+            if (params.n_parallel_load <= 0) {
+                params.n_parallel_load = -1; // unlimited
+            }
+        }
+    ).set_env("LLAMA_ARG_PARALLEL_LOAD"));
+    add_opt(common_arg(
         {"-tps", "--tensor-parallel-size"}, "T",
         "with -sm tensor: GPUs per TP group; remaining GPUs form pipeline stages. "
         "Must divide the number of GPUs. T=0 (default) puts all GPUs in one TP group.",

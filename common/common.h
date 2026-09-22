@@ -492,6 +492,8 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    int32_t n_parallel_load = -1; // max parallel jobs for model loading (-1 = all backend contexts, 1 = sequential)
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

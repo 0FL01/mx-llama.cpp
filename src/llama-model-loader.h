@@ -9,9 +9,11 @@
 
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -87,6 +89,9 @@ struct llama_model_loader {
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_OFF;
 
     llama_files files;
+    // path of each file opened by name; empty entries (external file pointers)
+    // cannot be reopened per-thread and keep sequential loading
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -113,9 +118,11 @@ struct llama_model_loader {
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
-    size_t size_done = 0;
+    std::atomic<size_t> size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    std::mutex mmaps_used_mutex;
+    std::atomic<bool> final_cleanup_done = false;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
