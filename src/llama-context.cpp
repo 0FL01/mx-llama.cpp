@@ -3700,6 +3700,14 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // Restoring sequence state rewrites memory tensors (KV cells, recurrent state) in
+    // place via deferred ggml_backend_tensor_set calls. Drain any in-flight graph work
+    // first, then invalidate the cached reusable graph so the next ubatch is rebuilt
+    // against the restored memory state instead of reusing stale baked-in views.
+    // Mirrors the gf_res_prev->reset() done after memory updates and in graph_reserve.
+    synchronize();
+    gf_res_prev->reset();
+
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
