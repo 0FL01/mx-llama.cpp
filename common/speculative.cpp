@@ -1291,6 +1291,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (size_t c = 0; c < count; ++c) {
             const auto & pc = pending[c];
 
+            // the draft KV injections must stay position-contiguous: a hole left by
+            // an mtmd chunk (or a reused prefix) that bypassed process() would fail
+            // the inject below - zero-fill it first
+            {
+                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), pc.seq_id);
+                if (pc.p0 > pos_max + 1) {
+                    if (!seed_draft_hole(pc.seq_id, pos_max + 1, pc.p0)) {
+                        return false;
+                    }
+                }
+            }
+
             batch_inject.n_tokens = pc.n;
             std::memcpy(batch_inject.embd, g_rows[c].data(), (size_t) pc.n * n_embd_dec * sizeof(float));
 
@@ -1318,6 +1330,83 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool flush_pending() {
         return flush_pending_upto(pending.size());
+    }
+
+    // Seed a positional hole in the draft KV cache with zero features. mtmd image
+    // chunks decode straight into the target context and never reach process(),
+    // and reused prompt prefixes skip prefill ubatches the drafter never saw, so
+    // the draft cache can end with a gap that fails its consecutive-position
+    // check (llama_decode rc=-1). Zero-filled rows keep the cache contiguous;
+    // drafted tokens are still verified by the target, so this costs post-gap
+    // acceptance only, never correctness. Ported from z-lab/llama.cpp-fork#1.
+    bool seed_draft_hole(llama_seq_id seq_id, llama_pos gap_beg, llama_pos gap_end) {
+        auto * ctx_dft = params.ctx_dft;
+
+        LOG_WRN("%s: draft cache hole for seq %d: [%d, %d) - seeding with zero features "
+                "(multimodal chunk or reused prompt prefix bypassed process())\n",
+                __func__, (int) seq_id, (int) gap_beg, (int) gap_end);
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        for (llama_pos off = gap_beg; off < gap_end; off += n_ubatch) {
+            const int32_t n_chunk = std::min<int32_t>(n_ubatch, (int32_t) (gap_end - off));
+
+            features_buf.assign((size_t) n_chunk * n_embd_enc, 0.0f);
+
+            std::vector<llama_pos> enc_pos;
+            if (is_mrope) {
+                enc_pos.resize((size_t) 4 * n_chunk);
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    enc_pos[0 * n_chunk + i] = off + i;
+                    enc_pos[1 * n_chunk + i] = off + i;
+                    enc_pos[2 * n_chunk + i] = off + i;
+                    enc_pos[3 * n_chunk + i] = 0;
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc = llama_encode(ctx_dft, enc_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_encode(ctx_dft) zero-fill failed rc=%d (n_tokens=%d, pos=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) off);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos p = off + i;
+                batch_inject.pos[i] = p;
+                if (is_mrope) {
+                    batch_inject.pos[1 * n_chunk + i] = p;
+                    batch_inject.pos[2 * n_chunk + i] = p;
+                    batch_inject.pos[3 * n_chunk + i] = 0;
+                }
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i]    = false;
+            }
+
+            rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) zero-fill failed rc=%d (n_tokens=%d, pos=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) off);
+                return false;
+            }
+            llama_synchronize(ctx_dft);
+        }
+        return true;
     }
 
     bool reset(llama_seq_id seq_id) override {
@@ -1547,7 +1636,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-                // inject the DFlash decoder K/V cache at the tokens' target positions
+                // inject the DFlash decoder K/V cache at the tokens' target positions;
+                // zero-fill any hole an mtmd chunk or reused prefix left below p_first
+                {
+                    const llama_pos p_first = batch_in.pos[rows[offset]];
+                    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+                    if (p_first > pos_max + 1) {
+                        if (!seed_draft_hole(seq_id, pos_max + 1, p_first)) {
+                            return false;
+                        }
+                    }
+                }
+
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
