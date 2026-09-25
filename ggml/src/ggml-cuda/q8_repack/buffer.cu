@@ -159,6 +159,32 @@ static __global__ void repack_mxfp4_kernel(
     }
 }
 
+// Device-side Q4_0 repack: canonical block_q4_0 (18 B: half d, then 16 packed
+// nibble bytes) to packed nibble rows plus a contiguous FP16 scale plane.
+static __global__ void repack_q4_0_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_blocks, const int64_t qs_str,
+        const int64_t qs_len, const int64_t src_stride, const int64_t dst_stride,
+        const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
+
+        uint8_t * d_qs = dst + e * dst_stride + row * qs_str + blk * 16;
+        uint8_t * d_d  = dst + e * dst_stride + qs_len + (row * n_blocks + blk) * 2;
+
+        const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 18;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            d_qs[k] = sb[2 + k];
+        }
+        d_d[0] = sb[0];
+        d_d[1] = sb[1];
+    }
+}
+
 struct repack_async_state {
     uint8_t *           scratch  = nullptr;
     size_t              cap      = 0;
@@ -213,6 +239,11 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                 break;
             case GGML_TYPE_MXFP4:
                 repack_mxfp4_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                break;
+            case GGML_TYPE_Q4_0:
+                repack_q4_0_kernel<<<grid, block, 0, stream>>>(
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;

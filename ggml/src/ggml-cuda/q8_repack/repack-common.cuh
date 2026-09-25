@@ -5,6 +5,7 @@
 #include "../mmq.cuh"
 #include "../quantize.cuh"
 #include "../vecdotq.cuh"   // get_int_from_table_16, for the MXFP4 nibble expand
+#include "repack-q4-0-host.h"
 
 #include <cstddef>
 
@@ -39,10 +40,12 @@ static __host__ __device__ inline T repack_qs_stride(const T ne0) {
 
 // Per-type qs row stride and scale row bytes: Q8_0 rows carry ne0 payload
 // bytes and 2 B f16 scales per sub-block, MXFP4 rows carry packed nibbles
-// (ne0/2 B) and 1 B e8m0 scales per sub-block. Both share the de-alias bump.
+// (ne0/2 B) and 1 B e8m0 scales per sub-block, and Q4_0 rows carry packed
+// nibbles (ne0/2 B) and 2 B f16 scales per sub-block. All share de-aliasing.
 template <typename T>
 static __host__ __device__ inline T repack_qs_row_stride(const ggml_type type, const T ne0) {
-    return repack_qs_stride(type == GGML_TYPE_MXFP4 ? ne0 / 2 : ne0);
+    const bool packed_nibbles = type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q4_0;
+    return repack_qs_stride(packed_nibbles ? ne0 / 2 : ne0);
 }
 template <typename T>
 static __host__ __device__ inline T repack_scale_row_bytes(const ggml_type type, const T ne0) {
@@ -61,13 +64,16 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         // uint16_t; only the GLOBAL load narrows.
         case GGML_TYPE_MXFP4:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32));
+        // Packed nibble plane plus a separate 2-byte FP16 scale per sub-block.
+        case GGML_TYPE_Q4_0:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 2);
         default:             GGML_ABORT("unsupported repack type");
     }
 }
 
 // Bytes per sub-block in the qs plane, and uint4 loads needed to fetch one.
 static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
-    return type == GGML_TYPE_MXFP4 ? 16 : 32;
+    return type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q4_0 ? 16 : 32;
 }
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)

@@ -101,6 +101,16 @@ void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t 
     }
 }
 
+// Host repack of one Q4_0 matrix: verbatim packed nibble rows followed by the
+// contiguous FP16 scale plane. Q4_0 remains 4-bit packed in the destination.
+void repack_q4_0_host(const block_q4_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    GGML_ASSERT(sizeof(block_q4_0) == 18);
+    const size_t qs_str = (size_t) repack_qs_row_stride(GGML_TYPE_Q4_0, ne0);
+    GGML_ASSERT(qs_str == repack_q4_0_planar_qs_row_stride(ne0));
+    repack_q4_0_planar_host((const uint8_t *) blocks, dst, ne0, ne1, qs_str);
+}
+
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
     switch (type) {
         case GGML_TYPE_Q8_0:
@@ -108,6 +118,9 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             break;
         case GGML_TYPE_MXFP4:
             repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q4_0:
+            repack_q4_0_host((const block_q4_0 *) blocks, dst, ne0, ne1);
             break;
         default:
             GGML_ABORT("unsupported repack type");
