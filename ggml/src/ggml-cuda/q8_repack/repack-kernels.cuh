@@ -391,11 +391,10 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 }
 
 // Generic repacked mat-vec: any type with 32-value sub-blocks, fetched through
-// rp_traits<WT>::load_w. Simple LANES-strided sub-block loop: both production
-// instantiations of the Q8_0 mat-vec run WPR == 1 (dense <16,16,false,64>, MoE
-// <64,16,true,16>), so this kernel requires WPR == 1 and skips the k-slice
-// machinery. Q8_0 keeps its tuned bespoke kernel; every other type gets this
-// one for free, including the fused up/gate variant.
+// rp_traits<WT>::load_w. Q8_0 keeps its tuned bespoke kernel; other types use
+// this shared implementation, including the fused up/gate variant. Q4_0 uses
+// two 16-value partial dots per block and merges corresponding lanes across
+// two waves before reduction to preserve canonical accumulation order.
 template <ggml_type WT, int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64,
           bool HAS_FUSION = false>
 static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(

@@ -1,6 +1,6 @@
 # Repacked-weight path (AMD GCN)
 
-Custom matmul frontend for gfx906 (Q8_0 and MXFP4). Weights are converted at upload into a
+Custom matmul frontend for gfx906 (Q8_0, MXFP4 and opt-in Q4_0). Weights are converted at upload into a
 two-plane layout consumed by dp4a-based mat-vec and tiled GEMM kernels. Kernel
 bodies are guarded by `#if defined(GGML_USE_HIP) && defined(__gfx906__)`;
 elsewhere they emit `NO_DEVICE_CODE` stubs.
@@ -18,6 +18,54 @@ The folder is self-contained: the only header seen outside is `repack.cuh`
    `{MM_ID, MM_ID, GLU}` and `{MM, ADD}` subgraphs are fused for repacked
    weights via explicit branches in `ggml_cuda_try_fuse`. The canonical-layout
    fused kernels stay suppressed.
+
+## Q4_0 qualification controls
+
+See [the recorded Q4_0 qualification](Q4_0-qualification.md) for exact workload,
+correctness limits and measured PP/TG/MTP results (no demonstrated speedup).
+
+`GGML_CUDA_REPACK_Q4_0=1` enables Q4_0 placement before model loading;
+unset or `0` preserves canonical Q4_0. `--no-repack` still disables all
+loader repacking. Do not switch kernels independently of the loaded layout.
+Q4_0 FFN/bias fusion is deliberately unavailable; the unfused paths are used.
+
+Q4_0 stores 16 packed nibble bytes and the original FP16 scale per 32 weights,
+with the same 16-byte row de-alias padding as other repacked types. Codes
+remain 0..15; register unpacking does not create an int8 weight plane.
+Every dot product includes `d4*d8*dot(q,q8) - 8*d4*activation_sum`.
+The implementation keeps the weight scale outside the correction bracket and
+matches canonical MMV half-block partial dots and cross-wave accumulation.
+Algebraically distributing the scale can amplify small differences through
+activation requantization and recurrent routing; isolated matmul NMSE alone
+is not sufficient model qualification.
+MMV/narrow consume Q8_1 scale/sum pairs and MMQ consumes upstream DS4 pairs.
+Multi-expert storage concatenates a separate payload/scale pair per expert.
+Supported full-K row/expert views translate canonical coordinates into those
+planes; unsupported consumers and batched dense weights are not admitted.
+
+`GGML_CUDA_REPACK_Q4_0_STATS=1` prints aggregate dense/MoE width and MMQ32/64
+host-dispatch counters at shutdown. They count dispatches, not graph replays;
+disable diagnostics for timing. `GGML_CUDA_REPACK_WORKSPACE_COLS=N` caps
+grouped-MMQ workspace columns for qualification of chunk boundaries, including
+a one-column remainder (which must still use a grouped-MMQ consumer).
+
+HIP tests `test-q4-repack-layout`, `test-q4-repack-gpu` and
+`test-q4-repack-tp` cover exact host layout, canonical/planar output parity and
+two-device column/reduction splits. GPU test arguments `ne0 ne1 views` enable
+row/expert views; `Q4_REPACK_TEST_ASYNC=1` exercises asynchronous upload.
+The optional fourth GPU-test argument selects `q4_0`, `q8_0` or `mxfp4` for
+shared-path regression tests. `Q4_REPACK_TEST_WEIGHT_FILE` and
+`Q4_REPACK_TEST_INPUT_FILE` replay canonical weight bytes and F32 activations
+at the supplied dimensions without views.
+
+Manual `test-q4-repack-model` accepts normal model/context/offload arguments.
+`Q4_REPACK_TEST_TOKENS_PATH` supplies a JSON token array;
+`Q4_REPACK_TEST_LOGITS_PATH` saves the first full F32 vocabulary vector and
+`Q4_REPACK_TEST_PPL=1` scores the supplied tokens with teacher forcing.
+`tests/benchmark-q4-repack-model.py` persists fixed token fixtures and HTTP
+request/response records for separate PP/TG and MTP A/B runs. Speculative
+response timings expose `draft_verify_widths` for actual target verifies,
+including checkpoint replays; `draft_verif_steps` counts committing steps.
 
 ## The repacked weight layout
 
