@@ -411,7 +411,8 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     constexpr int NWARPS = (NWAVES * 64) / LANES;
     constexpr int WPR    = NWARPS / ROWS;
-    static_assert(WPR == 1, "generic repack mat-vec assumes one lane-group per row");
+    constexpr int PARTS = rp_traits<WT>::mmv_parts;
+    static_assert(WPR == 1 || (WPR == 2 && PARTS == 2), "mat-vec row geometry");
 
     if constexpr (!HAS_FUSION) {
         GGML_UNUSED_VARS(wbase_gate, x_bias, gate_bias, glu_op);
@@ -439,33 +440,78 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 
     const int warp_id = threadIdx.x / LANES;
     const int lane    = threadIdx.x % LANES;
-    const int row     = blockIdx.x * ROWS + warp_id;
+    const int row     = blockIdx.x * ROWS + warp_id / WPR;
 
     // Clamped rows read a valid row's data and discard the result at the write.
     const uint32_t wrow = min((uint32_t) row, ne1 - 1);
 
     float acc = 0.0f;
     [[maybe_unused]] float acc_gate = 0.0f;
-    for (uint32_t sb = (uint32_t) lane; sb < n_sub; sb += LANES) {
+    const int part = lane % PARTS;
+    for (uint32_t sb = (uint32_t) ((warp_id % WPR * LANES + lane) / PARTS);
+         sb < n_sub; sb += LANES * WPR / PARTS) {
         uint4 lo, hi;
         uint16_t ds;
         rp_traits<WT>::load_w(wbase, wg, wrow, sb, lo, hi, ds);
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
+        const float sx = __high2float(xb->ds);
         const int * x32 = reinterpret_cast<const int *>(xb->qs);
-        int idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
-        idot    += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
-        acc += rp_traits<WT>::scale(ds) * dx * (float) idot;
+        int idot;
+        if constexpr (PARTS == 2) {
+            const uint32_t * l = reinterpret_cast<const uint32_t *>(&lo) + 2 * part;
+            const uint32_t * h = reinterpret_cast<const uint32_t *>(&hi) + 2 * part;
+            idot = ggml_cuda_dp4a(l[0], x32[2 * part], 0);
+            idot = ggml_cuda_dp4a(h[0], x32[4 + 2 * part], idot);
+            idot = ggml_cuda_dp4a(l[1], x32[1 + 2 * part], idot);
+            idot = ggml_cuda_dp4a(h[1], x32[5 + 2 * part], idot);
+        } else {
+            idot = mmvq_dp4a_u4(lo, x32[0], x32[1], x32[2], x32[3]);
+            idot += mmvq_dp4a_u4(hi, x32[4], x32[5], x32[6], x32[7]);
+        }
+        if constexpr (rp_traits<WT>::affine) {
+            const float2 d2 = rp_traits<WT>::scale2(ds);
+            acc += rp_traits<WT>::affine_dot(d2, dx, sx, idot, PARTS);
+        } else {
+            acc += rp_traits<WT>::scale(ds) * dx * (float) idot;
+        }
         if constexpr (HAS_FUSION) {
             if (use_gate) {
                 uint4 glo, ghi;
                 uint16_t gds;
                 rp_traits<WT>::load_w(wbase_gate, wg, wrow, sb, glo, ghi, gds);
-                int gdot = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
-                gdot    += mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
-                acc_gate += rp_traits<WT>::scale(gds) * dx * (float) gdot;
+                int gdot;
+                if constexpr (PARTS == 2) {
+                    const uint32_t * l = reinterpret_cast<const uint32_t *>(&glo) + 2 * part;
+                    const uint32_t * h = reinterpret_cast<const uint32_t *>(&ghi) + 2 * part;
+                    gdot = ggml_cuda_dp4a(l[0], x32[2 * part], 0);
+                    gdot = ggml_cuda_dp4a(h[0], x32[4 + 2 * part], gdot);
+                    gdot = ggml_cuda_dp4a(l[1], x32[1 + 2 * part], gdot);
+                    gdot = ggml_cuda_dp4a(h[1], x32[5 + 2 * part], gdot);
+                } else {
+                    gdot = mmvq_dp4a_u4(glo, x32[0], x32[1], x32[2], x32[3]);
+                    gdot += mmvq_dp4a_u4(ghi, x32[4], x32[5], x32[6], x32[7]);
+                }
+                if constexpr (rp_traits<WT>::affine) {
+                    const float2 gd2 = rp_traits<WT>::scale2(gds);
+                    acc_gate += rp_traits<WT>::affine_dot(gd2, dx, sx, gdot, PARTS);
+                } else {
+                    acc_gate += rp_traits<WT>::scale(gds) * dx * (float) gdot;
+                }
             }
         }
+    }
+    if constexpr (WPR == 2) {
+        __shared__ float sums[ROWS][LANES];
+        __shared__ float gates[HAS_FUSION ? ROWS : 1][LANES];
+        if (warp_id % WPR) {
+            sums[warp_id / WPR][lane] = acc;
+            if constexpr (HAS_FUSION) gates[warp_id / WPR][lane] = acc_gate;
+        }
+        __syncthreads();
+        if (warp_id % WPR) return;
+        acc += sums[warp_id / WPR][lane];
+        if constexpr (HAS_FUSION) acc_gate += gates[warp_id / WPR][lane];
     }
     const float a = rp_warp_reduce_sum<LANES>(acc);
     [[maybe_unused]] float g = 0.0f;
@@ -531,7 +577,7 @@ static __device__ void mmq_gemm_repacked_impl(
 
     const block_q8_1_mmq_h * x_group = xmmq;
 
-    // Raw-register types (MXFP4) prefetch one uint4 of packed nibbles per
+    // Raw-register types (MXFP4 and Q4_0) prefetch one uint4 of packed nibbles per
     // sub-block - half the live registers of the expanded pair, which spilled
     // 16-22 VGPRs per lane - and expand once per element at the LDS store.
     // LDS stays expanded: expanding at consume instead multiplied the expand
@@ -542,6 +588,7 @@ static __device__ void mmq_gemm_repacked_impl(
     __shared__ uint16_t sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
     __shared__ sXq_row_q8 sXq[BN];
     __shared__ float    sXd[BN][MMQ_RP_Q8_BK + 1];
+    __shared__ float    sXs[rp_traits<WT>::affine ? BN : 1][MMQ_RP_Q8_BK + 1];
     __shared__ uint32_t sCol[BN];
 
     constexpr int NROW = MMQ_RP_Q8_BM / NRL;
@@ -630,9 +677,16 @@ static __device__ void mmq_gemm_repacked_impl(
                 xcol = xval ? sCol[lr] : 0;
             }
             if (xval && sb < n_sub) {
-                px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+                if constexpr (rp_traits<WT>::affine) {
+                    px[i] = rp_x_sub_from_mmq_group_ds(x_grp, xcol, lk);
+                } else {
+                    px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+                }
             } else {
+                px[i].q0 = make_uint4(0, 0, 0, 0);
+                px[i].q1 = make_uint4(0, 0, 0, 0);
                 px[i].d = 0.0f;
+                px[i].s = 0.0f;
             }
         }
     };
@@ -672,7 +726,11 @@ static __device__ void mmq_gemm_repacked_impl(
                 xcol = sCol[lr];
             }
 
-            px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+            if constexpr (rp_traits<WT>::affine) {
+                px[i] = rp_x_sub_from_mmq_group_ds(x_grp, xcol, lk);
+            } else {
+                px[i] = rp_x_sub_from_mmq_group(x_grp, xcol, lk);
+            }
         }
     };
 
@@ -689,7 +747,7 @@ static __device__ void mmq_gemm_repacked_impl(
             const int lk = e % MMQ_RP_Q8_BK;
             if constexpr (RAW_REG) {
                 uint4 lo, hi;
-                rp_mxfp4_expand(pw_lo[i], lo, hi);
+                rp_traits<WT>::expand_raw(pw_lo[i], lo, hi);
                 sW_lo[lr][lk] = lo;
                 sW_hi[lr][lk] = hi;
             } else {
@@ -713,12 +771,16 @@ static __device__ void mmq_gemm_repacked_impl(
             sXq[sXr].q[lk][0] = px[i].q0;
             sXq[sXr].q[lk][1] = px[i].q1;
             sXd[sXr][lk]    = px[i].d;
+            if constexpr (rp_traits<WT>::affine) {
+                sXs[sXr][lk] = px[i].s;
+            }
         }
     };
 
     auto compute_stage = [&]() {
         for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
             float dx  [TN_];
+            [[maybe_unused]] float sx[TN_];
             int   xq32[TN_][8];
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
@@ -726,6 +788,9 @@ static __device__ void mmq_gemm_repacked_impl(
                 const uint4 q0 = sXq[xcol].q[kk][0];
                 const uint4 q1 = sXq[xcol].q[kk][1];
                 dx[n] = sXd[xcol][kk];
+                if constexpr (rp_traits<WT>::affine) {
+                    sx[n] = sXs[xcol][kk];
+                }
                 xq32[n][0] = (int) q0.x;
                 xq32[n][1] = (int) q0.y;
                 xq32[n][2] = (int) q0.z;
@@ -755,7 +820,7 @@ static __device__ void mmq_gemm_repacked_impl(
                         whi = sW_hi[row_base + r + 1][kk];
                     }
 
-                    const float d = rp_traits<WT>::scale(dh[rr]);
+                    [[maybe_unused]] const float d = rp_traits<WT>::scale(dh[rr]);
 
 #pragma unroll
                     for (int n = 0; n < TN_; n++) {
@@ -775,6 +840,18 @@ static __device__ void mmq_gemm_repacked_impl(
                             hi = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], hi);
                             hi = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], hi);
                             acc[r][n] += d * dx[n] * (float) lo + d * dx[n] * (float) hi;
+                        } else if constexpr (rp_traits<WT>::affine) {
+                            int idot = 0;
+                            idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
+                            const float2 d2 = rp_traits<WT>::scale2(dh[rr]);
+                            acc[r][n] += rp_traits<WT>::affine_dot(d2, dx[n], sx[n], idot);
                         } else {
                         int idot = 0;
                         idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
@@ -903,7 +980,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
 // traffic the same way, on the repacked layout. Dense only: the single-token
 // path and the MoE ids path keep their existing kernels.
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false,
-          int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+          int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0, int WPR = 1>
 static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -921,10 +998,11 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
     constexpr int NWARPS = (NWAVES * 64) / LANES;
     static_assert(LANES >= 1 && LANES <= 64 && (LANES & (LANES - 1)) == 0,
                   "LANES must be a power of two, at most one wave");
-    static_assert(ROWS == NWARPS * RPL, "row geometry");
+    static_assert(ROWS == NWARPS * RPL / WPR && NWARPS % WPR == 0, "row geometry");
+    static_assert(WPR == 1 || WPR == 2, "supported lane groups per row");
     const int warp_id = threadIdx.x / LANES;
     const int lane    = threadIdx.x % LANES;
-    const int row     = blockIdx.x * ROWS + warp_id * RPL;
+    const int row     = blockIdx.x * ROWS + warp_id / WPR * RPL;
 
     const uint32_t n_blocks = ne0 >> 5;
     const typename rp_traits<WT>::geom wg(ne0, ne1);
@@ -960,61 +1038,129 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
     // activation block per column per 32 quants. The half-block stride paid
     // both twice, and at sharded row counts the loop is a handful of
     // iterations, so per-step overhead is most of the kernel.
-    for (uint32_t sb = (uint32_t) lane; sb < n_blocks; sb += (uint32_t) LANES) {
+    constexpr int PARTS = rp_traits<WT>::mmv_parts;
+    const int part = lane % PARTS;
+    for (uint32_t sb = (uint32_t) ((warp_id % WPR * LANES + lane) / PARTS);
+         sb < n_blocks; sb += (uint32_t) (WPR * LANES / PARTS)) {
         // Weights for the lane's rows stay in registers; the activation block is
         // re-read per row from L1, which is cheaper than the register pressure
         // of holding NCOLS x 8 ints alongside the accumulators.
         uint4 wv0[RPL], wv1[RPL];
         float dw[RPL];
+        [[maybe_unused]] float dw_correction[RPL];
 #pragma unroll
         for (int r = 0; r < RPL; ++r) {
             uint16_t db;
             rp_traits<WT>::load_w(wbase, wg, wrows[r], sb, wv0[r], wv1[r], db);
-            dw[r] = rp_traits<WT>::scale(db & rmasks[r]);
+            if constexpr (rp_traits<WT>::affine) {
+                const float2 d2 = rp_traits<WT>::scale2(db & rmasks[r]);
+                dw[r] = d2.x;
+                dw_correction[r] = d2.y;
+            } else {
+                dw[r] = rp_traits<WT>::scale(db & rmasks[r]);
+            }
         }
         [[maybe_unused]] uint4 gv0[GR], gv1[GR];
         [[maybe_unused]] float dg[GR];
+        [[maybe_unused]] float dg_correction[GR];
         if constexpr (HAS_FUSION) {
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
                 uint16_t gb;
                 rp_traits<WT>::load_w(wbase_gate, wg, wrows[r], sb, gv0[r], gv1[r], gb);
-                dg[r] = rp_traits<WT>::scale(gb & rmasks[r]);
+                if constexpr (rp_traits<WT>::affine) {
+                    const float2 d2 = rp_traits<WT>::scale2(gb & rmasks[r]);
+                    dg[r] = d2.x;
+                    dg_correction[r] = d2.y;
+                } else {
+                    dg[r] = rp_traits<WT>::scale(gb & rmasks[r]);
+                }
             }
         }
 #pragma unroll
         for (int c = 0; c < NCOLS; ++c) {
             const block_q8_1 * xb = xq + (size_t) c * xs + sb;
             const float dx = __low2float(xb->ds);
+            const float sx = __high2float(xb->ds);
             const int * x = reinterpret_cast<const int *>(xb->qs);
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
                 int idot = 0;
-                idot = ggml_cuda_dp4a((int) wv0[r].x, x[0], idot);
-                idot = ggml_cuda_dp4a((int) wv0[r].y, x[1], idot);
-                idot = ggml_cuda_dp4a((int) wv0[r].z, x[2], idot);
-                idot = ggml_cuda_dp4a((int) wv0[r].w, x[3], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].x, x[4], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].y, x[5], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].z, x[6], idot);
-                idot = ggml_cuda_dp4a((int) wv1[r].w, x[7], idot);
-                acc[r][c] += dw[r] * dx * (float) idot;
+                if constexpr (PARTS == 2) {
+                    const uint32_t * l = reinterpret_cast<const uint32_t *>(&wv0[r]) + 2 * part;
+                    const uint32_t * h = reinterpret_cast<const uint32_t *>(&wv1[r]) + 2 * part;
+                    idot = ggml_cuda_dp4a(l[0], x[2 * part], idot);
+                    idot = ggml_cuda_dp4a(h[0], x[4 + 2 * part], idot);
+                    idot = ggml_cuda_dp4a(l[1], x[1 + 2 * part], idot);
+                    idot = ggml_cuda_dp4a(h[1], x[5 + 2 * part], idot);
+                } else {
+                    idot = ggml_cuda_dp4a((int) wv0[r].x, x[0], idot);
+                    idot = ggml_cuda_dp4a((int) wv0[r].y, x[1], idot);
+                    idot = ggml_cuda_dp4a((int) wv0[r].z, x[2], idot);
+                    idot = ggml_cuda_dp4a((int) wv0[r].w, x[3], idot);
+                    idot = ggml_cuda_dp4a((int) wv1[r].x, x[4], idot);
+                    idot = ggml_cuda_dp4a((int) wv1[r].y, x[5], idot);
+                    idot = ggml_cuda_dp4a((int) wv1[r].z, x[6], idot);
+                    idot = ggml_cuda_dp4a((int) wv1[r].w, x[7], idot);
+                }
+                if constexpr (rp_traits<WT>::affine) {
+                    acc[r][c] += rp_traits<WT>::affine_dot(make_float2(dw[r], dw_correction[r]), dx, sx, idot, PARTS);
+                } else {
+                    acc[r][c] += dw[r] * dx * (float) idot;
+                }
                 if constexpr (HAS_FUSION) {
                     int gdot = 0;
-                    gdot = ggml_cuda_dp4a((int) gv0[r].x, x[0], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv0[r].y, x[1], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv0[r].z, x[2], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv0[r].w, x[3], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].x, x[4], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].y, x[5], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].z, x[6], gdot);
-                    gdot = ggml_cuda_dp4a((int) gv1[r].w, x[7], gdot);
-                    accg[r][c] += dg[r] * dx * (float) gdot;
+                    if constexpr (PARTS == 2) {
+                        const uint32_t * l = reinterpret_cast<const uint32_t *>(&gv0[r]) + 2 * part;
+                        const uint32_t * h = reinterpret_cast<const uint32_t *>(&gv1[r]) + 2 * part;
+                        gdot = ggml_cuda_dp4a(l[0], x[2 * part], gdot);
+                        gdot = ggml_cuda_dp4a(h[0], x[4 + 2 * part], gdot);
+                        gdot = ggml_cuda_dp4a(l[1], x[1 + 2 * part], gdot);
+                        gdot = ggml_cuda_dp4a(h[1], x[5 + 2 * part], gdot);
+                    } else {
+                        gdot = ggml_cuda_dp4a((int) gv0[r].x, x[0], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv0[r].y, x[1], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv0[r].z, x[2], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv0[r].w, x[3], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv1[r].x, x[4], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv1[r].y, x[5], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv1[r].z, x[6], gdot);
+                        gdot = ggml_cuda_dp4a((int) gv1[r].w, x[7], gdot);
+                    }
+                    if constexpr (rp_traits<WT>::affine) {
+                        accg[r][c] += rp_traits<WT>::affine_dot(make_float2(dg[r], dg_correction[r]), dx, sx, gdot, PARTS);
+                    } else {
+                        accg[r][c] += dg[r] * dx * (float) gdot;
+                    }
                 }
             }
         }
     }
 
+    if constexpr (WPR == 2) {
+        __shared__ float sums[NWARPS / WPR][RPL][NCOLS][LANES];
+        __shared__ float gates[HAS_FUSION ? NWARPS / WPR : 1][GR][GC][LANES];
+        if (warp_id % WPR) {
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+#pragma unroll
+                for (int c = 0; c < NCOLS; ++c) {
+                    sums[warp_id / WPR][r][c][lane] = acc[r][c];
+                    if constexpr (HAS_FUSION) gates[warp_id / WPR][r][c][lane] = accg[r][c];
+                }
+            }
+        }
+        __syncthreads();
+        if (warp_id % WPR) return;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+#pragma unroll
+            for (int c = 0; c < NCOLS; ++c) {
+                acc[r][c] += sums[warp_id / WPR][r][c][lane];
+                if constexpr (HAS_FUSION) accg[r][c] += gates[warp_id / WPR][r][c][lane];
+            }
+        }
+    }
 #pragma unroll
     for (int r = 0; r < RPL; ++r) {
 #pragma unroll
@@ -1024,7 +1170,7 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
             if constexpr (HAS_FUSION) {
                 g = rp_warp_reduce_sum<LANES>(accg[r][c]);
             }
-            if (lane == 0 && (row + r) < (int) ne1) {
+            if (warp_id % WPR == 0 && lane == 0 && (row + r) < (int) ne1) {
                 float out = a;
                 if constexpr (HAS_FUSION) {
                     out = rp_mmv_fusion_epilogue(a, g, x_bias, gate_bias,
@@ -1041,12 +1187,12 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
 #endif
 }
 
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0, int WPR = 1>
 static __global__ void mul_mat_vec_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
-    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT>(
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT, WPR>(
         wbase, xq, y, ne0, ne1, xs, ys, nullptr, nullptr, nullptr,
         GGML_GLU_OP_REGLU, 0);
 }

@@ -21,6 +21,12 @@ inline bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor *) {
     return false;
 }
 
+inline void ggml_cuda_repack_q4_0_record(bool, int64_t, int) {}
+
+inline const uint8_t * repack_view_get_cached(const ggml_tensor *, const ggml_tensor *, cudaStream_t) {
+    GGML_ABORT("repacked weights are unavailable on MUSA");
+}
+
 inline void ggml_cuda_repack_set_tensor_async(
         int, cudaStream_t, ggml_tensor *, const void *, size_t, size_t) {
     GGML_ABORT("repacked weights are unavailable on MUSA");
@@ -68,6 +74,11 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device);
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t);
 
 bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0);
+
+// path: 0 = MMV/narrow, 32/64 = grouped MMQ tile width. Shutdown-only summary.
+void ggml_cuda_repack_q4_0_record(bool has_ids, int64_t width, int path);
+
+const uint8_t * repack_view_get_cached(const ggml_tensor * view, const ggml_tensor * base, cudaStream_t stream);
 
 // Async-upload path: canonical chunks stage into per-device scratch and the
 // device-side repack kernel runs when the tensor completes. The scratch is

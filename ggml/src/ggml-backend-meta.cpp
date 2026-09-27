@@ -223,6 +223,11 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_device_get_extra_bufts(ggm
 
 static bool ggml_backend_meta_buft_is_repack(ggml_backend_buffer_type_t buft);
 
+static bool ggml_backend_meta_q4_0_repack_enabled() {
+    const char * value = std::getenv("GGML_CUDA_REPACK_Q4_0");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -247,6 +252,9 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         switch (w->type) {
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_MXFP4:
+                break;
+            case GGML_TYPE_Q4_0:
+                if (!ggml_backend_meta_q4_0_repack_enabled()) return false;
                 break;
             default:
                 return false;

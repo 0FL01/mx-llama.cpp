@@ -3,9 +3,46 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 
+#include <cstdlib>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
+
+static bool repack_q4_0_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_REPACK_Q4_0");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+void ggml_cuda_repack_q4_0_record(const bool has_ids, const int64_t width, const int path) {
+    struct counters {
+        std::atomic<uint64_t> calls[2][11] = {};
+        ~counters() {
+            for (int ids = 0; ids < 2; ++ids) {
+                for (int slot = 1; slot < 11; ++slot) {
+                    const uint64_t n = calls[ids][slot].load(std::memory_order_relaxed);
+                    if (n != 0) std::fprintf(stderr,
+                        "Q4_0 repack stats: %s %s=%d calls=%llu fused=0\n",
+                        ids ? "MUL_MAT_ID" : "MUL_MAT", slot < 9 ? "MMV-width" : "MMQ",
+                        slot < 9 ? slot : (slot == 9 ? 32 : 64), (unsigned long long) n);
+                }
+            }
+        }
+    };
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_REPACK_Q4_0_STATS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled) return;
+    static counters stats;
+    const int slot = path == 32 ? 9 : path == 64 ? 10 : (int) width;
+    GGML_ASSERT(slot >= 1 && slot <= 10);
+    stats.calls[has_ids ? 1 : 0][slot].fetch_add(1, std::memory_order_relaxed);
+}
 
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // Views are never in repacked layout (the scale-plane offset needs the FULL ne1).
@@ -18,6 +55,8 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         case GGML_TYPE_MXFP4: {
             return t->ne[0] % 32 == 0;
         }
+        case GGML_TYPE_Q4_0:
+            return repack_q4_0_enabled() && t->ne[0] % 32 == 0;
         default:             return false;
     }
 }
@@ -44,13 +83,23 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     if (ggml_cuda_repack_tensor_supported(src0)) {
         return true;              // full tensor in repacked layout
     }
-    return src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src);
+    const ggml_tensor * base = src0->view_src;
+    if (base == nullptr || !ggml_cuda_repack_tensor_supported(base) ||
+        src0->ne[0] != base->ne[0] || src0->nb[1] != base->nb[1] ||
+        src0->ne[3] != 1 || src0->view_offs % base->nb[1] != 0 ||
+        src0->nb[2] % base->nb[1] != 0) {
+        return false;
+    }
+    for (int64_t e = 0; e < src0->ne[2]; ++e) {
+        const size_t row = (src0->view_offs + e * src0->nb[2]) / base->nb[1];
+        if (row / base->ne[1] >= (size_t) base->ne[2] ||
+            row % base->ne[1] + src0->ne[1] > (size_t) base->ne[1]) return false;
+    }
+    return true;
 }
 
-// The FUSED mat-vec path dispatches to mul_mat_vec_q8_0_repacked, which is Q8_0-only:
-// an MXFP4 sub-block is a single uint4 of nibbles, so that kernel's half-block
-// indexing (2 uint4 per sub-block) has no MXFP4 equivalent. MXFP4 reaches the GEMM
-// for every token count instead, so it must not be offered the fusion.
+// Fusion remains limited to Q8_0/MXFP4. Q4_0 needs the activation-sum correction
+// on both up and gate legs and stays explicitly disabled until fused parity exists.
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
     const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
     return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) &&
@@ -134,11 +183,13 @@ struct RepackViewCacheKey {
     int64_t ne0;
     int64_t ne1;
     int64_t ne2;
+    size_t nb2;
     bool operator<(const RepackViewCacheKey & o) const {
         if (view_data != o.view_data) return view_data < o.view_data;
         if (ne0 != o.ne0) return ne0 < o.ne0;
         if (ne1 != o.ne1) return ne1 < o.ne1;
-        return ne2 < o.ne2;
+        if (ne2 != o.ne2) return ne2 < o.ne2;
+        return nb2 < o.nb2;
     }
 };
 
@@ -160,7 +211,6 @@ const uint8_t * repack_view_get_cached(
     const int64_t ne2_v = view->ne[2];
     const int64_t ne0_b = base->ne[0];
     const int64_t ne1_b = base->ne[1];
-    const int64_t ne2_b = base->ne[2];
     GGML_ASSERT(ne0_v == ne0_b);
     GGML_ASSERT(base->view_src == nullptr);
 
@@ -169,17 +219,14 @@ const uint8_t * repack_view_get_cached(
     const int64_t qs_str  = repack_qs_row_stride(base->type, ne0_v);
     const int64_t sc_row  = repack_scale_row_bytes(base->type, ne0_v);
     const uint8_t * base_ptr = (const uint8_t *) base->data;
-    const uint8_t * view_ptr = (const uint8_t *) view->data;
-
-    const int64_t row_start = (int64_t)(view_ptr - base_ptr) / qs_str;
-    GGML_ASSERT((view_ptr - base_ptr) % qs_str == 0);
+    GGML_ASSERT(ggml_cuda_repack_mul_mat_should_fire(view));
 
     // Copy every expert in the view (ne1_v x ne2_v), not just ne1_v rows.
     const size_t qs_size = (size_t) ne1_v * ne2_v * qs_str;
     const size_t sc_size = (size_t) ne1_v * ne2_v * sc_row;
     const size_t total   = qs_size + sc_size;
 
-    RepackViewCacheKey key{ view->data, ne0_v, ne1_v, ne2_v };
+    RepackViewCacheKey key{ view->data, ne0_v, ne1_v, ne2_v, view->nb[2] };
 
     std::lock_guard<std::mutex> lock(s_view_cache_mutex);
     auto it = s_view_cache.find(key);
@@ -190,15 +237,21 @@ const uint8_t * repack_view_get_cached(
     uint8_t * d_ptr;
     CUDA_CHECK(cudaMalloc(&d_ptr, total));
 
-    // QS plane: copy from the view's position in the base QS plane.
-    CUDA_CHECK(cudaMemcpyAsync(d_ptr, view_ptr, qs_size,
-        cudaMemcpyDeviceToDevice, stream));
-
-    // Scale plane: starts after the FULL base QS plane.
-    const uint8_t * src_scales = base_ptr + (size_t) ne1_b * ne2_b * qs_str
-                                       + (size_t) row_start * sc_row;
-    CUDA_CHECK(cudaMemcpyAsync(d_ptr + qs_size, src_scales, sc_size,
-        cudaMemcpyDeviceToDevice, stream));
+    // GGML view offsets/strides are canonical. Translate each expert's row
+    // coordinates; upload stores a separate QS+scale pair per expert.
+    const size_t base_stride = repack_gcn_nbytes(base->type, ne0_b, ne1_b);
+    const size_t view_stride = repack_gcn_nbytes(view->type, ne0_v, ne1_v);
+    for (int64_t e = 0; e < ne2_v; ++e) {
+        const size_t row = (view->view_offs + e * view->nb[2]) / base->nb[1];
+        const uint8_t * expert = base_ptr + (row / ne1_b) * base_stride;
+        const size_t r = row % ne1_b;
+        uint8_t * out = d_ptr + e * view_stride;
+        CUDA_CHECK(cudaMemcpyAsync(out, expert + r * qs_str, ne1_v * qs_str,
+            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(out + ne1_v * qs_str,
+            expert + ne1_b * qs_str + r * sc_row, ne1_v * sc_row,
+            cudaMemcpyDeviceToDevice, stream));
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 

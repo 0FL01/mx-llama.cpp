@@ -77,6 +77,17 @@ static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
 }
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
+// Q4_0 stores q[0..15] in low nibbles and q[16..31] in high nibbles of
+// successive bytes. Keep the unsigned codes intact; the affine correction is
+// applied with the Q8_1 activation sum in the shared compute epilogue.
+static __device__ __forceinline__ void rp_q4_0_expand(
+        const uint4 raw, uint4 & lo, uint4 & hi) {
+    constexpr uint32_t M = 0x0F0F0F0Fu;
+    lo = make_uint4(raw.x & M, raw.y & M, raw.z & M, raw.w & M);
+    hi = make_uint4((raw.x >> 4) & M, (raw.y >> 4) & M,
+                    (raw.z >> 4) & M, (raw.w >> 4) & M);
+}
+
 // MXFP4 sub-block: 16 payload bytes coding 32 values as nibbles.
 // get_int_from_table_16 returns v.x for the four LOW nibbles and v.y for the four
 // HIGH nibbles, and stock load_tiles_mxfp4 stores them at k0 and k0 + QI_MXFP4 -
@@ -124,11 +135,16 @@ static __device__ __forceinline__ int sX_swizzle(int lr) {
 
 struct rp_x_sub {
     uint4 q0, q1;
-    float d;
+    float d, s;
 };
 
 struct block_q8_1_mmq_h {
     float  d4[4];
+    int8_t qs[QK8_1_MMQ];
+};
+
+struct block_q8_1_mmq_ds_h {
+    half2  ds4[4];
     int8_t qs[QK8_1_MMQ];
 };
 
@@ -138,6 +154,10 @@ static_assert(offsetof(block_q8_1_mmq_h, d4) == offsetof(block_q8_1_mmq, d4),
               "block_q8_1_mmq_h d4 offset mismatch");
 static_assert(offsetof(block_q8_1_mmq_h, qs) == offsetof(block_q8_1_mmq, qs),
               "block_q8_1_mmq_h qs offset mismatch");
+static_assert(sizeof(block_q8_1_mmq_ds_h) == sizeof(block_q8_1_mmq),
+              "Unexpected block_q8_1_mmq_ds_h size");
+static_assert(offsetof(block_q8_1_mmq_ds_h, qs) == offsetof(block_q8_1_mmq, qs),
+              "block_q8_1_mmq_ds_h qs offset mismatch");
 
 struct sXq_row_q8 {
     uint4 q[MMQ_RP_Q8_BK][2];
@@ -217,6 +237,22 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group(
     out.q0 = mq[0];
     out.q1 = mq[1];
     out.d  = m.d4[lk];
+    out.s  = 0.0f;
+    return out;
+}
+
+__device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group_ds(
+        const block_q8_1_mmq_h * __restrict__ group, const uint32_t col,
+        const uint32_t lk) {
+    const block_q8_1_mmq_ds_h & m =
+        *reinterpret_cast<const block_q8_1_mmq_ds_h *>(group + col);
+    const uint4 * mq = reinterpret_cast<const uint4 *>(m.qs + lk * QK8_1);
+    const float2 ds = __half22float2(m.ds4[lk]);
+    rp_x_sub out;
+    out.q0 = mq[0];
+    out.q1 = mq[1];
+    out.d  = ds.x;
+    out.s  = ds.y;
     return out;
 }
 
@@ -232,6 +268,8 @@ template <ggml_type T> struct rp_traits;
 
 template <> struct rp_traits<GGML_TYPE_Q8_0> {
     static constexpr bool raw_lds = false;
+    static constexpr bool affine = false;
+    static constexpr int mmv_parts = 1;
     // de-aliased qs rows [ne1 x rs], then an f16 scale plane [ne1 x n_sub].
     struct geom {
         uint32_t rs, rs_u4, n_sub;
@@ -256,6 +294,8 @@ template <> struct rp_traits<GGML_TYPE_Q8_0> {
 };
 
 template <> struct rp_traits<GGML_TYPE_MXFP4> {
+    static constexpr bool affine = false;
+    static constexpr int mmv_parts = 1;
     // de-aliased nibble rows [ne1 x rs], then a 1-byte e8m0 plane [ne1 x n_sub].
     struct geom {
         uint32_t rs, rs_u4, n_sub;
@@ -281,14 +321,68 @@ template <> struct rp_traits<GGML_TYPE_MXFP4> {
         raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
         d   = wbase[g.dplane_off + (size_t) wrow * g.n_sub + sb];
     }
+    static __device__ __forceinline__ void expand_raw(const uint4 raw, uint4 & lo, uint4 & hi) {
+        rp_mxfp4_expand(raw, lo, hi);
+    }
     static __device__ __forceinline__ float scale(const uint16_t s) {
         return ggml_cuda_e8m0_to_fp32((uint8_t) s) * 0.5f;
     }
 #endif
 };
 
+template <> struct rp_traits<GGML_TYPE_Q4_0> {
+    // Q4_0 codes are affine around zero-point 8 and need activation-sum
+    // correction. Raw packed bytes stay in registers through MMQ prefetch.
+    static constexpr bool affine = true;
+    static constexpr bool raw_lds = true;
+    // Preserve canonical MMV's two 16-value partial dots per Q8_1 block.
+    static constexpr int mmv_parts = 2;
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   dplane_off;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q4_0, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5), dplane_off((size_t) ne1 * rs) {}
+    };
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb,
+            uint4 & lo, uint4 & hi, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        rp_q4_0_expand(rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb), lo, hi);
+        d = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ void expand_raw(const uint4 raw, uint4 & lo, uint4 & hi) {
+        rp_q4_0_expand(raw, lo, hi);
+    }
+    static __device__ __forceinline__ float scale(const uint16_t s) {
+        return __half2float(*reinterpret_cast<const __half *>(&s));
+    }
+    static __device__ __forceinline__ float2 scale2(const uint16_t s) {
+        const float d = scale(s);
+        return make_float2(d, 8.0f * d);
+    }
+    static __device__ __forceinline__ float affine_dot(
+            const float2 d, const float dx, const float sx, const int idot, const int parts = 1) {
+        // Preserve stock Q4_0's scale-after-correction association. Applying
+        // d to both terms before subtraction adds avoidable rounding at the
+        // offset cancellation, which downstream Q8 quantization can amplify.
+        return d.x * (dx * (float) idot - (8.0f / parts) * sx);
+    }
+#endif
+};
+
 // One entry per supported repack type - generates the dispatch switches.
-#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)
+#define RP_FOREACH_TYPE(X) \
+    X(GGML_TYPE_Q8_0)      \
+    X(GGML_TYPE_MXFP4)     \
+    X(GGML_TYPE_Q4_0)
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);

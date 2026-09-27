@@ -5431,6 +5431,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
+        // Persistent view materialization may allocate and synchronize. Warm
+        // new view entries before capture, even when graph properties match a
+        // previously freed graph at the same addresses.
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * w = cgraph->nodes[i]->src[0];
+            if (w != nullptr && w->view_src != nullptr &&
+                ggml_cuda_repack_mul_mat_should_fire(w)) {
+                repack_view_get_cached(w, w->view_src, cuda_ctx->stream());
+            }
+        }
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6035,6 +6045,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;   // a repacked weight can only be src0
             }
             if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+                return false;
+            }
+            if ((op->op == GGML_OP_MUL_MAT && ggml_n_dims(op->src[0]) != 2) ||
+                (op->op == GGML_OP_MUL_MAT_ID && ggml_n_dims(op->src[0]) != 3)) {
                 return false;
             }
             // Views of repacked weights are re-packed on the fly by the dispatch, so

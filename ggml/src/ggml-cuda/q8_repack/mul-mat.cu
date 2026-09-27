@@ -9,7 +9,7 @@
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
-        cudaStream_t stream);
+        cudaStream_t stream, bool grouped = false);
 template <ggml_type WT>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
@@ -46,6 +46,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const int64_t x_stride    = ne10_padded / QK8_1;
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
+        if (src0->type == GGML_TYPE_Q4_0) ggml_cuda_repack_q4_0_record(false, ne11, 0);
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
         // tiled path below computes a full 32-wide tile whatever the batch is.
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
@@ -77,6 +78,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_MXFP4>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
+                    case GGML_TYPE_Q4_0:
+                        ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_0>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
                     default: GGML_ABORT("unsupported repack type");
                 }
             }
@@ -90,6 +95,16 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
 
     int64_t chunk_ne11 = ctx.repack_workspace_cols_cap > 0 ?
         std::min(ne11, ctx.repack_workspace_cols_cap) : ne11;
+    // Optional bounded-workspace override also makes remainder-layout tests
+    // reproducible without deliberately exhausting device memory.
+    static const int64_t cols_override = [] {
+        const char * value = getenv("GGML_CUDA_REPACK_WORKSPACE_COLS");
+        if (value == nullptr) return (int64_t) 0;
+        char * end = nullptr;
+        const long long cols = strtoll(value, &end, 10);
+        return end != value && *end == '\0' && cols > 0 ? (int64_t) cols : (int64_t) 0;
+    }();
+    if (cols_override > 0) chunk_ne11 = std::min(chunk_ne11, cols_override);
     ggml_cuda_pool_alloc<block_q8_1_mmq_h> src1_q8_1(ctx.pool());
     auto try_workspace = [&]() {
         return src1_q8_1.try_alloc(ne13 * ne12 * chunk_ne11 * n_groups) != nullptr;
@@ -144,7 +159,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
                            + col*dst_s1;
             ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
-                ne00, ne01, iter_ne11, stream);
+                ne00, ne01, iter_ne11, stream, true);
         }
         }
     }
@@ -156,6 +171,28 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const uint32_t xs, const uint32_t ys, cudaStream_t stream) {
+    if constexpr (rp_traits<WT>::affine) {
+        // Match stock's partial-dot and cross-wave order: downstream Q8
+        // requantization in HC/GDN can amplify a one-ULP difference.
+#define RP_NC_AFFINE(NC, WAVES, WPR) \
+        case NC: { \
+            const dim3 grid((ne01 + 1) / 2, 1, 1); \
+            mul_mat_vec_repacked_nc<2, WAVES, NC, 2, 64, WT, WPR><<<grid, WAVES * 64, 0, stream>>>( \
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); \
+        } break;
+        switch (ne11) {
+            RP_NC_AFFINE(2, 2, 2)
+            RP_NC_AFFINE(3, 2, 2)
+            RP_NC_AFFINE(4, 2, 2)
+            RP_NC_AFFINE(5, 1, 1)
+            RP_NC_AFFINE(6, 1, 1)
+            RP_NC_AFFINE(7, 1, 1)
+            RP_NC_AFFINE(8, 1, 1)
+            default: GGML_ABORT("unsupported affine narrow width");
+        }
+#undef RP_NC_AFFINE
+        return;
+    }
     // Geometry per width, measured on Qwen3.8-27B (pp512 at that ubatch, 4x
     // MI50 -sm tensor). The row count per lane is small once the tensor is
     // split, so scheduling granularity beats per-group reuse and 64-thread
@@ -259,8 +296,8 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
-        cudaStream_t stream) {
-    if (ne11 == 1) {
+        cudaStream_t stream, const bool grouped) {
+    if (ne11 == 1 && !grouped) {
         switch (src0->type) {
             case GGML_TYPE_Q8_0: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
@@ -284,12 +321,19 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 1, 0, 0, 0);
             } break;
+            case GGML_TYPE_Q4_0: {
+                const dim3 grid((ne01 + 3) / 4, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q4_0, 4, 8, false><<<grid, 512, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 1, 0, 0, 0);
+            } break;
             default: GGML_ABORT("unsupported repack type");
         }
         return;
     }
 
     // Multi-token: 64-wide GEMM for large batches, 32-wide for small ones.
+    if (src0->type == GGML_TYPE_Q4_0) ggml_cuda_repack_q4_0_record(false, ne11, ne11 >= 128 ? 64 : 32);
     const int nrl  = MMQ_RP_Q8_NROW_LANES;
     const int mmq_bm = MMQ_RP_Q8_BM;
     if (ne11 >= 128) {
@@ -307,6 +351,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
+            case GGML_TYPE_Q4_0:
+                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0><<<grid, dim3(64, nrl), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
             default: GGML_ABORT("unsupported repack type");
         }
     } else {
@@ -321,6 +370,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_MXFP4:
                 mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_MXFP4><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q4_0:
+                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
