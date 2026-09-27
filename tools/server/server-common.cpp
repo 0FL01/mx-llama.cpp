@@ -82,6 +82,11 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+        base["draft_verif_steps"] = n_draft_verif_steps;
+        base["draft_verify_widths"] = json::object();
+        for (const auto & item : draft_verify_widths) {
+            base["draft_verify_widths"][std::to_string(item.first)] = item.second;
+        }
     }
 
     return base;

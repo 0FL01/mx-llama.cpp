@@ -3943,6 +3943,8 @@ private:
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
+            ++slot.stats.draft_verify_widths[n_draft + 1];
+
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft

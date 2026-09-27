@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cinttypes>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -359,6 +360,9 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+    // Actual target verify widths (draft + target token), including checkpoint
+    // replay. Kept separate from accepted-token counts and graph dispatches.
+    std::map<size_t, uint64_t> draft_verify_widths;
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
