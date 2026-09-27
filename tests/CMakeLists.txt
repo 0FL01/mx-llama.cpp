@@ -300,6 +300,18 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-q4-repack-layout.cpp)
+if (GGML_HIP)
+  # Manual real-model oracle; requires explicit model/prompt arguments.
+  llama_build(test-q4-repack-model.cpp)
+  llama_build_and_test(test-q4-repack-gpu.cpp LABEL "gpu")
+  set_tests_properties(test-q4-repack-gpu PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "GGML_CUDA_REPACK_Q4_0=1")
+  llama_build_and_test(test-q4-repack-tp.cpp LABEL "gpu")
+  set_tests_properties(test-q4-repack-tp PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "GGML_CUDA_REPACK_Q4_0=1")
+endif()
 llama_build_and_test(test-moe-cache.cpp)
 llama_build_and_test(test-dummy-mmvq.cpp)
 llama_build_and_test(test-ple-history.cpp)
