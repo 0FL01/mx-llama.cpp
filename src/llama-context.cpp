@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -824,11 +825,22 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+    synchronize("other");
+}
+
+void llama_context::synchronize(const char * reason) {
     if (!sched) {
         return;
     }
 
+    static const bool trace = []() {
+        const char * value = std::getenv("LLAMA_THROUGHPUT_TRACE");
+        return value && std::strcmp(value, "0") != 0;
+    }();
+    const int64_t begin_us = trace ? ggml_time_us() : 0;
+    const int32_t queued = n_queued_tokens;
     ggml_backend_sched_synchronize(sched.get());
+    const int64_t end_us = trace ? ggml_time_us() : 0;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -855,6 +867,11 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+    if (trace) {
+        LLAMA_LOG_INFO("throughput-sync: {\"reason\":\"%s\",\"mtp\":%s,\"begin_us\":%lld,\"end_us\":%lld,\"duration_us\":%lld,\"queued_tokens\":%d}\n",
+            reason, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "true" : "false",
+            (long long) begin_us, (long long) end_us, (long long) (end_us - begin_us), queued);
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2027,6 +2044,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    const int64_t trace_pos = batch_inp.pos && batch_inp.n_tokens > 0 ? batch_inp.pos[0] : -1;
+    if (moe_cache) {
+        moe_cache->trace("decode_begin", batch_inp.n_tokens, trace_pos);
+    }
     // A short tail of a prefill batch must still use the stock graph.
     moe_cache_decode = batch_inp.n_tokens >= 1 && batch_inp.n_tokens <= 3;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
@@ -2470,8 +2491,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // Both CPU observers and GPU slot readers must finish before eviction.
     if (moe_cache && batch_inp.n_tokens <= 3) {
-        synchronize();
+        synchronize("cache_before_step");
         moe_cache->step();
+    }
+
+    if (moe_cache) {
+        moe_cache->trace("decode_end", batch_inp.n_tokens, trace_pos);
     }
 
     return 0;
@@ -3705,7 +3730,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     // first, then invalidate the cached reusable graph so the next ubatch is rebuilt
     // against the restored memory state instead of reusing stale baked-in views.
     // Mirrors the gf_res_prev->reset() done after memory updates and in graph_reserve.
-    synchronize();
+    synchronize("state_seq_set_inner");
     gf_res_prev->reset();
 
     std::unique_ptr<llama_io_read_i> io;
@@ -4440,17 +4465,17 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize("api");
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize("get_logits");
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize("get_logits_ith");
 
     float * res = nullptr;
 
@@ -4564,13 +4589,13 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize("get_nextn");
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize("get_nextn_ith");
 
     return ctx->get_embeddings_nextn_ith(i);
 }
@@ -4586,25 +4611,25 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize("get_sampled_token");
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize("get_sampled_probs");
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize("get_sampled_logits");
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize("get_sampled_candidates");
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
@@ -4854,12 +4879,12 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize("state_seq_get");
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize("state_seq_set_outer");
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }

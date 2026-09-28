@@ -19,6 +19,9 @@ std::unique_ptr<llama_moe_cache> llama_moe_cache::create(const llama_model & mod
     auto cache = std::make_unique<llama_moe_cache>();
     cache->max_inserts = inserts;
     cache->report_each_step = std::getenv("LLAMA_MOE_CACHE_STATS_EACH_STEP") != nullptr;
+    if (const char * value = std::getenv("LLAMA_THROUGHPUT_TRACE")) {
+        cache->trace_enabled = std::strcmp(value, "0") != 0;
+    }
     if (const char * policy = std::getenv("LLAMA_MOE_CACHE_POLICY")) {
         if (std::strcmp(policy, "frequency") == 0) { cache->frequency_gated = true; }
         else if (std::strcmp(policy, "ranked") != 0) { throw std::runtime_error("invalid LLAMA_MOE_CACHE_POLICY"); }
@@ -111,6 +114,42 @@ const llama_moe_cache_layer * llama_moe_cache::lookup(const ggml_tensor * up) co
         if (c.up_src == up) { return &c; }
     }
     return nullptr;
+}
+
+void llama_moe_cache::trace(const char * phase, int64_t n_tokens, int64_t pos) const {
+    if (!trace_enabled) {
+        return;
+    }
+    int64_t routes = 0, hits = 0, admissions = 0, evictions = 0, resident = 0;
+    uint64_t fingerprint = 14695981039346656037ULL;
+    const auto mix = [&](uint32_t value) {
+        fingerprint = (fingerprint ^ value) * 1099511628211ULL;
+    };
+    for (const auto & c : layers) {
+        const auto * observed = static_cast<const int64_t *>(c.observations->data);
+        const auto * table = static_cast<const int32_t *>(c.host_table->data);
+        const int64_t n_expert = c.up_src->ne[2];
+        routes += observed[n_expert];
+        hits += observed[n_expert + 1];
+        admissions += c.admissions;
+        evictions += c.evictions;
+        mix(c.n_slots);
+        mix((uint32_t) n_expert);
+        for (int64_t id = 0; id < n_expert; ++id) {
+            mix((uint32_t) table[id]);
+        }
+        for (const int32_t id : c.slot_expert) {
+            resident += id >= 0;
+            mix((uint32_t) id);
+        }
+    }
+    // Host tables change only after synchronized decode steps. Wide prefill
+    // never writes observers, so these snapshots do not add a producer wait.
+    LLAMA_LOG_INFO("throughput-cache: {\"phase\":\"%s\",\"tokens\":%lld,\"pos\":%lld,\"time_us\":%lld,\"layers\":%zu,\"steps\":%lld,\"routes\":%lld,\"hits\":%lld,\"admissions\":%lld,\"evictions\":%lld,\"resident\":%lld,\"upload_bytes\":%zu,\"update_us\":%lld,\"fingerprint\":\"%016llx\"}\n",
+        phase, (long long) n_tokens, (long long) pos, (long long) ggml_time_us(), layers.size(),
+        (long long) steps, (long long) routes, (long long) hits, (long long) admissions,
+        (long long) evictions, (long long) resident, upload_bytes, (long long) update_us,
+        (unsigned long long) fingerprint);
 }
 
 void llama_moe_cache::step() {

@@ -45,9 +45,11 @@ struct llama_moe_cache {
     size_t upload_bytes = 0;
     bool frequency_gated = false; // opt-in diagnostic policy; ranked LRU is default
     bool report_each_step = false;
+    bool trace_enabled = false;
 
     static std::unique_ptr<llama_moe_cache> create(const llama_model & model, int32_t slots, int32_t inserts,
                                                 const std::vector<ggml_backend_ptr> & backends);
     const llama_moe_cache_layer * lookup(const ggml_tensor * up) const;
     void step(); // caller must synchronize graph compute first
+    void trace(const char * phase, int64_t n_tokens, int64_t pos) const;
 };
