@@ -2,6 +2,7 @@
 #include "common.h"
 #include "download.h"
 #include "llama.h"
+#include "ngram-cache.h"
 #include "speculative.h"
 
 #include <cmath>
@@ -131,6 +132,32 @@ static void test(void) {
         common_speculative_draft(drafter.get());
 
         assert(result2.empty());
+    }
+
+    {
+        const llama_tokens pattern = { 10, 20, 30, 40 };
+        llama_tokens history;
+        for (int i = 0; i < 16; ++i) {
+            history.insert(history.end(), pattern.begin(), pattern.end());
+        }
+        for (int mode = 0; mode < 4; ++mode) {
+            common_ngram_cache context;
+            common_ngram_cache dynamic;
+            common_ngram_cache stat;
+            if (mode == 0 || mode == 3) {
+                common_ngram_cache_update(context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, history, history.size(), false);
+            }
+            if (mode == 1) {
+                common_ngram_cache_update(dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, history, history.size(), false);
+            }
+            if (mode == 2 || mode == 3) {
+                common_ngram_cache_update(stat, LLAMA_NGRAM_STATIC, LLAMA_NGRAM_STATIC, history, history.size(), false);
+            }
+            llama_tokens input = pattern;
+            llama_tokens draft = { pattern.back() };
+            common_ngram_cache_draft(input, draft, 8, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, context, dynamic, stat);
+            assert(draft == llama_tokens({ 40, 10, 20, 30, 40, 10, 20, 30, 40 }));
+        }
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
