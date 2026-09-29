@@ -84,6 +84,8 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// Metadata only: replay may include a corrective token in the state-update count.
+void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted, bool replay_correction);
 
 // Discard transient state and report if the shared target/draft prompt cache is invalid.
 bool common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);

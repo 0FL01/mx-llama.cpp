@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -153,6 +154,8 @@ struct common_speculative_impl {
     size_t n_acc_tokens = 0; // number of tokens accepted by the target model.
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
+    size_t n_replay_corrections = 0;
+    std::vector<size_t> n_replay_corrections_per_pos;
 
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
@@ -3735,6 +3738,10 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_accept(spec, seq_id, n_accepted, false);
+}
+
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, bool replay_correction) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3756,6 +3763,13 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (n_accepted > 0) {
             impl->n_acc_drafts++;
             impl->n_acc_tokens += n_accepted;
+            if (replay_correction) {
+                impl->n_replay_corrections++;
+                if (impl->n_replay_corrections_per_pos.size() < n_accepted) {
+                    impl->n_replay_corrections_per_pos.resize(n_accepted, 0);
+                }
+                impl->n_replay_corrections_per_pos[n_accepted - 1]++;
+            }
         }
 
         impl->accept(seq_id, n_accepted, false);
@@ -3818,6 +3832,21 @@ void common_speculative_print_stats(const common_speculative * spec) {
 
     for (const auto & impl : spec->impls) {
         std::string str_perf;
+        const char * stats_json = std::getenv("LLAMA_SPECULATIVE_STATS");
+        if (stats_json && strcmp(stats_json, "0") != 0) {
+            std::ostringstream positions;
+            for (size_t i = 0; i < impl->n_acc_tokens_per_pos.size(); ++i) {
+                const size_t corrections = i < impl->n_replay_corrections_per_pos.size() ? impl->n_replay_corrections_per_pos[i] : 0;
+                positions << (i ? "," : "") << impl->n_acc_tokens_per_pos[i] - corrections;
+            }
+            LOG_INF("speculative-source-stats: {\"time_us\":%lld,\"type\":\"%s\",\"begin_calls\":%zu,\"process_calls\":%zu,\"draft_calls\":%zu,\"accept_calls\":%zu,\"drafts\":%zu,\"proposed\":%zu,\"accepted\":%zu,\"callback_accepted\":%zu,\"replay_corrections\":%zu,\"begin_us\":%lld,\"process_us\":%lld,\"draft_us\":%lld,\"accept_us\":%lld,\"accepted_per_position\":[%s]}\n",
+                    (long long) ggml_time_us(), common_speculative_type_to_str(impl->type).c_str(),
+                    impl->n_call_begin, impl->n_call_process, impl->n_call_draft, impl->n_call_accept,
+                    impl->n_gen_drafts, impl->n_gen_tokens, impl->n_acc_tokens - impl->n_replay_corrections,
+                    impl->n_acc_tokens, impl->n_replay_corrections,
+                    (long long) impl->t_begin_us, (long long) impl->t_process_us,
+                    (long long) impl->t_draft_us, (long long) impl->t_accept_us, positions.str().c_str());
+        }
         if (impl->gen_perf) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
