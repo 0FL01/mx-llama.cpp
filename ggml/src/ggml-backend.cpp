@@ -835,6 +835,8 @@ struct ggml_backend_sched_timing {
     int64_t moe_h2d_bytes;
     int64_t moe_d2d_bytes;
     int64_t moe_tail_bytes;
+    int64_t moe_peer_h2d_bytes;
+    int64_t moe_peer_resident_bytes;
     int64_t us_graph_compute_enqueue;
     int64_t us_split_event_record;
 };
@@ -895,6 +897,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool moe_prefill_owner;
     bool sync_non_graph_inputs;
 
     int debug;
@@ -1002,9 +1005,10 @@ static void ggml_backend_sched_timing_maybe_print(ggml_backend_sched_t sched) {
 
     fprintf(stderr,
         "%s: moe_cache_hits=%" PRId64 " misses=%" PRId64 " h2d_bytes=%" PRId64
-        " d2d_bytes=%" PRId64 " tail_bytes=%" PRId64 "\n",
+        " d2d_bytes=%" PRId64 " tail_bytes=%" PRId64
+        " peer_h2d_bytes=%" PRId64 " peer_resident_bytes=%" PRId64 "\n",
         __func__, t->moe_cache_hits, t->moe_cache_misses, t->moe_h2d_bytes,
-        t->moe_d2d_bytes, t->moe_tail_bytes);
+        t->moe_d2d_bytes, t->moe_tail_bytes, t->moe_peer_h2d_bytes, t->moe_peer_resident_bytes);
 
     ggml_backend_sched_timing_reset(t);
 }
@@ -1325,6 +1329,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    if (sched->moe_prefill_owner && tensor->op == GGML_OP_MUL_MAT_ID && sched->moe_cache_lookup) {
+                        ggml_backend_sched_moe_cache_source source = {};
+                        if (sched->moe_cache_lookup(src, &source, sched->moe_cache_user_data)) {
+                            for (int b = 0; b < src_backend_id; b++) {
+                                if (sched->backends[b] == source.backend &&
+                                        ggml_backend_supports_op(sched->backends[b], tensor) &&
+                                        ggml_backend_offload_op(sched->backends[b], tensor)) {
+                                    SET_CAUSE(tensor, "1.moe_owner");
+                                    return b;
+                                }
+                            }
+                        }
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -2159,9 +2176,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // CUDA/HIP consume range descriptors at enqueue; only device pointers survive.
                     const bool range_copy_supported = reg_name &&
                             (strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "CUDA") == 0);
-                    const bool use_cache = sched->moe_cache_lookup && range_copy_supported &&
+                    const bool cache_available = sched->moe_cache_lookup && range_copy_supported &&
                             sched->moe_cache_lookup(input, &cache_source, sched->moe_cache_user_data) &&
-                            cache_source.backend == split_backend && cache_source.tensor && cache_source.table &&
+                            cache_source.backend && cache_source.tensor && cache_source.table &&
                             cache_source.n_slots > 0 && cache_source.tensor->type == input->type &&
                             cache_source.tensor->ne[0] == input->ne[0] &&
                             cache_source.tensor->ne[1] == input->ne[1] &&
@@ -2169,6 +2186,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             cache_source.tensor->nb[2] == expert_size && cache_source.tensor->buffer &&
                             cache_source.tensor->data && ggml_is_contiguous(cache_source.tensor) &&
                             split_backend->iface.cpy_tensor_async;
+                    const bool use_cache = cache_available && cache_source.backend == split_backend;
 
                     // Keep original groups and canonical tails; slot order is not expert-ID order.
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -2184,6 +2202,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             sched->timing.moe_h2d_bytes += sched->timing.enabled ? size : 0;
                         };
                         if (!use_cache) {
+                            if (sched->timing.enabled && cache_available) {
+                                sched->timing.moe_peer_h2d_bytes += expert_size_copy + padding_end;
+                                for (int32_t expert = first_id; expert <= last_id; ++expert) {
+                                    const int32_t slot = cache_source.table[expert];
+                                    if (slot >= 0 && slot < cache_source.n_slots) {
+                                        sched->timing.moe_peer_resident_bytes += expert_size;
+                                    }
+                                }
+                            }
                             copy_host(expert_offset, expert_size_copy + padding_end);
                         } else {
                             int32_t host_first = first_id;
@@ -2399,6 +2426,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->timing.enabled     = ggml_backend_sched_env_int("GGML_SCHED_TIMING", 0);
     sched->timing.interval    = std::max(1, ggml_backend_sched_env_int("GGML_SCHED_TIMING_INTERVAL", 64));
     sched->timing.trace_limit = std::max(0, ggml_backend_sched_env_int("GGML_SCHED_TRACE_INPUTS", 0));
+    sched->moe_prefill_owner = ggml_backend_sched_env_int("GGML_SCHED_MOE_PREFILL_OWNER", 0) == 1;
     if (sched->timing.enabled) {
         fprintf(stderr, "%s: timing enabled interval=%d trace_limit=%d\n", __func__, sched->timing.interval, sched->timing.trace_limit);
     }
