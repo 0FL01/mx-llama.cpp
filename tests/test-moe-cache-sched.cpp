@@ -104,7 +104,14 @@ static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_
     ggml_backend_tensor_set(x, values.data(), 0, values.size()*sizeof(float));
     ggml_backend_tensor_set(selected, ids.data(), 0, ids.size()*sizeof(int32_t));
     auto * out = ggml_mul_mat_id(compute.get(), weights, x, selected);
+    auto * matmul = out;
     ggml_set_output(out);
+    ggml_tensor * matmul_view = nullptr;
+    if (peer) {
+        matmul_view = ggml_reshape_2d(compute.get(), out, out->ne[0], 2*tokens);
+        out = ggml_scale(compute.get(), matmul_view, 1.0f);
+        ggml_set_output(out);
+    }
     auto * graph = ggml_new_graph_custom(compute.get(), 128, false);
     ggml_build_forward_expand(graph, out);
     ggml_backend_t backends[] = {gpu, peer ? peer : cpu, cpu};
@@ -127,8 +134,12 @@ static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_
     const char * owner_env = std::getenv("GGML_SCHED_MOE_PREFILL_OWNER");
     const bool prefer_owner = owner_env && std::atoi(owner_env) == 1 && tokens >= 64;
     if (peer) {
-        require(ggml_backend_sched_get_tensor_backend(sched.get(), out) == (prefer_owner ? peer : gpu),
+        require(ggml_backend_sched_get_tensor_backend(sched.get(), matmul) == (prefer_owner ? peer : gpu),
                 "expert offload did not select the expected backend");
+        require(ggml_backend_sched_get_tensor_backend(sched.get(), out) == gpu,
+                "owner preference changed auxiliary operation placement");
+        require(ggml_backend_sched_get_tensor_backend(sched.get(), matmul_view) == (prefer_owner ? peer : gpu),
+                "view did not follow its matmul source backend");
     }
     active_copy = &state;
     require(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS, "compute failed");

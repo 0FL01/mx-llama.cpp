@@ -1329,20 +1329,6 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                    if (sched->moe_prefill_owner && tensor->op == GGML_OP_MUL_MAT_ID &&
-                            tensor->ne[2] >= 64 && sched->moe_cache_lookup) {
-                        ggml_backend_sched_moe_cache_source source = {};
-                        if (sched->moe_cache_lookup(src, &source, sched->moe_cache_user_data)) {
-                            for (int b = 0; b < src_backend_id; b++) {
-                                if (sched->backends[b] == source.backend &&
-                                        ggml_backend_supports_op(sched->backends[b], tensor) &&
-                                        ggml_backend_offload_op(sched->backends[b], tensor)) {
-                                    SET_CAUSE(tensor, "1.moe_owner");
-                                    return b;
-                                }
-                            }
-                        }
-                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -1459,6 +1445,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     graph->uid = ggml_graph_next_uid();
 
+    std::vector<ggml_tensor *> moe_prefill_nodes;
+
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
@@ -1475,6 +1463,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
+            if (sched->moe_prefill_owner && sched->op_offload && sched->moe_cache_lookup &&
+                    node->op == GGML_OP_MUL_MAT_ID && node->ne[2] >= 64 && node->buffer == NULL) {
+                moe_prefill_nodes.push_back(node);
+            }
 
 #if 0
             // src
@@ -1667,6 +1659,39 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+    }
+
+    // Preserve baseline placement of GLU/weighting/reductions: early owner selection
+    // also moves those nodes and changes which CUDA/HIP fusions are selected.
+    bool moe_owner_changed = false;
+    for (ggml_tensor * node : moe_prefill_nodes) {
+        const ggml_tensor * weight = node->src[0];
+        if (!weight || !weight->buffer || weight->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !ggml_backend_buffer_is_host(weight->buffer) ||
+                ggml_backend_sched_backend_from_buffer(sched, weight, node) != sched->n_backends - 1) {
+            continue;
+        }
+        ggml_backend_sched_moe_cache_source source = {};
+        if (!sched->moe_cache_lookup(weight, &source, sched->moe_cache_user_data)) {
+            continue;
+        }
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            if (sched->backends[b] == source.backend && ggml_backend_supports_op(sched->backends[b], node) &&
+                    ggml_backend_offload_op(sched->backends[b], node)) {
+                moe_owner_changed |= tensor_backend_id(node) != b;
+                tensor_backend_id(node) = b;
+                SET_CAUSE(node, "4.moe_owner");
+                break;
+            }
+        }
+    }
+    if (moe_owner_changed) {
+        for (int i = 0; i < graph->n_nodes; i++) {
+            ggml_tensor * node = graph->nodes[i];
+            if (node->view_src && node->buffer == NULL) {
+                tensor_backend_id(node) = tensor_backend_id(node->view_src);
+            }
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
