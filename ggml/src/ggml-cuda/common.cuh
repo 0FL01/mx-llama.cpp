@@ -1387,6 +1387,17 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+#if defined(GGML_USE_HIP) || (!defined(GGML_USE_MUSA) && CUDART_VERSION >= 11030)
+#define GGML_CUDA_MOE_CACHE_DOWN
+#endif
+
+struct ggml_backend_moe_cache_down;
+
+inline bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+}
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1399,6 +1410,11 @@ struct ggml_cuda_graph {
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    struct moe_down_wait {
+        cudaGraphNode_t node;
+        ggml_backend_moe_cache_down * down;
+    };
+    std::vector<moe_down_wait> moe_down_waits;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1588,6 +1604,11 @@ struct ggml_backend_cuda_context {
     bool copy_only = false;
     cudaEvent_t copy_event = nullptr;
 
+    cudaStream_t moe_down_stream = nullptr;
+    std::vector<ggml_backend_moe_cache_down *> moe_down;
+    bool token_capture_active = false;
+    size_t token_graph_count = 0;
+
     // Dedicated stream + events for the meta-backend stage-transfer copies. Using a side
     // stream avoids serializing the cross-stage memcpy behind compute on the main stream,
     // so the next ubatch's stage-A compute can start on the source GPU while the prior
@@ -1628,6 +1649,8 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph * moe_down_capture = nullptr;
+
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;

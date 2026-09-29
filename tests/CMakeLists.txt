@@ -317,6 +317,12 @@ if (GGML_HIP)
   set_tests_properties(test-moe-cache-sched PROPERTIES
     SKIP_RETURN_CODE 77
     ENVIRONMENT "GGML_CUDA_REPACK_Q4_0=0")
+  target_compile_definitions(ggml-hip PRIVATE GGML_CUDA_MOE_CACHE_DOWN_TEST)
+  llama_build_and_test(test-moe-cache-down.cpp LABEL "gpu")
+  set_tests_properties(test-moe-cache-down PROPERTIES
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 120)
 endif()
 llama_build_and_test(test-moe-cache.cpp)
 llama_build_and_test(test-dummy-mmvq.cpp)
