@@ -2,9 +2,11 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mtp-vocab.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -572,7 +574,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_embd = cur;
     }
 
-    cur = build_lora_mm(output_w, cur, output_s);
+    if (is_mtp) {
+        static const std::string ranges_value = [] {
+            const char * value = std::getenv("LLAMA_MTP_DRAFT_VOCAB_RANGES");
+            return std::string(value ? value : "");
+        }();
+        const auto ranges = llama_mtp_vocab_ranges(ranges_value, output_w->ne[1]);
+        cb(cur, "mtp_head_input", -1);
+        if (ranges.empty()) {
+            cur = build_lora_mm(output_w, cur, output_s);
+        } else {
+            if (!loras->empty() || output_s) {
+                throw std::runtime_error("Restricted MTP vocabulary does not support LoRA or a scaled output head");
+            }
+            cur = llama_mtp_vocab_logits(ctx0, output_w, cur, ranges);
+        }
+    } else {
+        cur = build_lora_mm(output_w, cur, output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

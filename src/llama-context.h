@@ -407,6 +407,7 @@ private:
     };
 
     sampling_info sampling;
+    int64_t mtp_head_profile_begin_us = 0;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

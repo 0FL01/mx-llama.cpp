@@ -299,6 +299,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-mtp-vocab.cpp)
 llama_build_and_test(test-q4-repack-layout.cpp)
 if (GGML_HIP)
   # Manual real-model oracle; requires explicit model/prompt arguments.

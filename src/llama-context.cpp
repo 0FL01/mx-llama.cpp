@@ -146,6 +146,36 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    const char * head_profile = std::getenv("LLAMA_MTP_HEAD_PROFILE");
+    if (model.arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            head_profile && strcmp(head_profile, "0") != 0) {
+        if (cparams.cb_eval) {
+            throw std::runtime_error("MTP head profiling requires an unused eval callback");
+        }
+        // Separate diagnostic only: the interval includes scheduler and completion waits.
+        cparams.cb_eval = [](ggml_tensor * tensor, bool ask, void * user_data) {
+            const bool input = strcmp(tensor->name, "mtp_head_input") == 0;
+            if (!input && strcmp(tensor->name, "result_output") != 0) {
+                return false;
+            }
+            if (ask) {
+                return true;
+            }
+            auto * ctx = static_cast<llama_context *>(user_data);
+            const int64_t now = ggml_time_us();
+            if (input) {
+                ctx->mtp_head_profile_begin_us = now;
+            } else if (ctx->mtp_head_profile_begin_us > 0) {
+                LLAMA_LOG_INFO("mtp-head-profile: {\"begin_us\":%lld,\"end_us\":%lld,\"duration_us\":%lld,\"outputs\":%lld}\n",
+                        (long long) ctx->mtp_head_profile_begin_us, (long long) now,
+                        (long long) (now - ctx->mtp_head_profile_begin_us), (long long) tensor->ne[1]);
+                ctx->mtp_head_profile_begin_us = 0;
+            }
+            return true;
+        };
+        cparams.cb_eval_user_data = this;
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
