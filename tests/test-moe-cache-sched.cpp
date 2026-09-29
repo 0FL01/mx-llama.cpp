@@ -125,7 +125,7 @@ static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_
     ggml_backend_sched_set_eval_callback(sched.get(), check_staged_bytes, &state);
     require(ggml_backend_sched_alloc_graph(sched.get(), graph), "graph allocation failed");
     const char * owner_env = std::getenv("GGML_SCHED_MOE_PREFILL_OWNER");
-    const bool prefer_owner = owner_env && std::atoi(owner_env) == 1;
+    const bool prefer_owner = owner_env && std::atoi(owner_env) == 1 && tokens >= 64;
     if (peer) {
         require(ggml_backend_sched_get_tensor_backend(sched.get(), out) == (prefer_owner ? peer : gpu),
                 "expert offload did not select the expected backend");
@@ -236,11 +236,14 @@ int main() {
                 require(bool(peer_buffer), "peer cache allocation failed");
                 ggml_backend_buffer_set_usage(peer_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                 ggml_backend_tensor_set(peer_cache, cached.data(), 0, cached.size());
-                std::vector<int32_t> ids(128);
-                for (size_t i = 0; i < ids.size(); ++i) { ids[i] = i%2 ? 5 : 1; }
-                const auto baseline = run_case(cpu.get(), gpu.get(), weights, cache, raw, ids, 64, 1, 0);
-                const auto actual = run_case(cpu.get(), gpu.get(), weights, peer_cache, raw, ids, 64, 1, 2, peer.get());
-                require(actual == baseline, "owner placement output changed");
+                for (int tokens : {42, 64}) {
+                    std::vector<int32_t> ids(2*tokens);
+                    for (size_t i = 0; i < ids.size(); ++i) { ids[i] = i%2 ? 5 : 1; }
+                    const auto baseline = run_case(cpu.get(), gpu.get(), weights, cache, raw, ids, tokens, 1, 0);
+                    const auto actual = run_case(cpu.get(), gpu.get(), weights, peer_cache, raw, ids, tokens, 1, 2, peer.get());
+                    require(std::memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)) == 0,
+                            "owner placement output changed");
+                }
                 std::vector<uint8_t> after(cached.size());
                 ggml_backend_tensor_get(peer_cache, after.data(), 0, after.size());
                 require(after == cached, "peer cache payload or dummy changed");

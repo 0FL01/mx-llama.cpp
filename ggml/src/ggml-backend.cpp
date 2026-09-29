@@ -1329,7 +1329,8 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                    if (sched->moe_prefill_owner && tensor->op == GGML_OP_MUL_MAT_ID && sched->moe_cache_lookup) {
+                    if (sched->moe_prefill_owner && tensor->op == GGML_OP_MUL_MAT_ID &&
+                            tensor->ne[2] >= 64 && sched->moe_cache_lookup) {
                         ggml_backend_sched_moe_cache_source source = {};
                         if (sched->moe_cache_lookup(src, &source, sched->moe_cache_user_data)) {
                             for (int b = 0; b < src_backend_id; b++) {
