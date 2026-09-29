@@ -13,6 +13,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -64,6 +65,14 @@ json format_error_response(const std::string & message, const enum error_type ty
 // server_slot_stats
 //
 
+bool server_speculative_stats_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_SPECULATIVE_STATS");
+        return value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 json server_slot_stats::to_json() const {
     json base = {
         {"cache_n",                n_prompt_cached},
@@ -86,6 +95,25 @@ json server_slot_stats::to_json() const {
         base["draft_verify_widths"] = json::object();
         for (const auto & item : draft_verify_widths) {
             base["draft_verify_widths"][std::to_string(item.first)] = item.second;
+        }
+    }
+
+    if (server_speculative_stats_enabled()) {
+        base["target_decode_calls"] = n_target_decode_calls;
+        base["target_decode_tokens"] = n_target_decode_tokens;
+        base["target_prompt_decode_calls"] = n_target_prompt_decode_calls;
+        base["target_generation_decode_calls"] = n_target_generation_decode_calls;
+        base["target_checkpoint_restores"] = n_target_checkpoint_restores;
+        base["draft_checkpoint_restores"] = n_draft_checkpoint_restores;
+        base["draft_checkpoint_preverify_loads"] = n_draft_checkpoint_preverify_loads;
+        base["replay_verify_calls"] = n_replay_verify_calls;
+        base["target_decode_widths"] = json::object();
+        base["replay_verify_widths"] = json::object();
+        for (const auto & item : target_decode_widths) {
+            base["target_decode_widths"][std::to_string(item.first)] = item.second;
+        }
+        for (const auto & item : replay_verify_widths) {
+            base["replay_verify_widths"][std::to_string(item.first)] = item.second;
         }
     }
 

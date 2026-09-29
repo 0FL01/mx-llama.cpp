@@ -22,6 +22,8 @@
 
 using json = common_json;
 
+bool server_speculative_stats_enabled();
+
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
@@ -363,6 +365,17 @@ struct server_slot_stats {
     // Actual target verify widths (draft + target token), including checkpoint
     // replay. Kept separate from accepted-token counts and graph dispatches.
     std::map<size_t, uint64_t> draft_verify_widths;
+
+    uint64_t n_target_decode_calls = 0;
+    uint64_t n_target_decode_tokens = 0;
+    uint64_t n_target_prompt_decode_calls = 0;
+    uint64_t n_target_generation_decode_calls = 0;
+    std::map<size_t, uint64_t> target_decode_widths;
+    uint64_t n_target_checkpoint_restores = 0;
+    uint64_t n_draft_checkpoint_restores = 0;
+    uint64_t n_draft_checkpoint_preverify_loads = 0;
+    uint64_t n_replay_verify_calls = 0;
+    std::map<size_t, uint64_t> replay_verify_widths;
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

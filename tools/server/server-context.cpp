@@ -3083,6 +3083,9 @@ private:
             if (ctx_dft) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (server_speculative_stats_enabled() && !ckpt.data_dft.empty()) {
+                        ++slot.stats.n_draft_checkpoint_preverify_loads;
+                    }
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -3775,6 +3778,33 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
+            if (server_speculative_stats_enabled()) {
+                for (auto & slot : slots) {
+                    if (!slot.stats.is_set()) {
+                        continue;
+                    }
+                    uint64_t owned_tokens = 0;
+                    for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                        for (int32_t j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                            if (batch_view.seq_id[i][j] == slot.id) {
+                                ++owned_tokens;
+                                break;
+                            }
+                        }
+                    }
+                    if (owned_tokens == 0) {
+                        continue;
+                    }
+                    ++slot.stats.n_target_decode_calls;
+                    slot.stats.n_target_decode_tokens += owned_tokens;
+                    ++slot.stats.target_decode_widths[owned_tokens];
+                    if (slot.state == SLOT_STATE_GENERATING) {
+                        ++slot.stats.n_target_generation_decode_calls;
+                    } else {
+                        ++slot.stats.n_target_prompt_decode_calls;
+                    }
+                }
+            }
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -3944,6 +3974,10 @@ private:
             const size_t n_draft = slot.spec_draft.size();
 
             ++slot.stats.draft_verify_widths[n_draft + 1];
+            if (server_speculative_stats_enabled() && slot.spec_is_replay) {
+                ++slot.stats.n_replay_verify_calls;
+                ++slot.stats.replay_verify_widths[n_draft + 1];
+            }
 
             GGML_ASSERT(n_draft > 0);
 
@@ -3985,8 +4019,15 @@ private:
 
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
+                        if (server_speculative_stats_enabled()) {
+                            ++slot.stats.n_target_checkpoint_restores;
+                        }
+
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            if (server_speculative_stats_enabled()) {
+                                ++slot.stats.n_draft_checkpoint_restores;
+                            }
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
