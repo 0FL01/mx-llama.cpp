@@ -2027,6 +2027,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        ggml_backend_moe_prefill_stream_t stream_experts = nullptr;
+        const ggml_tensor * stream_source = nullptr;
+        ggml_backend_sched_moe_cache_source stream_cache = {};
         sched->timing.n_splits += sched->timing.enabled ? 1 : 0;
         ggml_backend_event_t input_staging_event = sched->input_staging_events[split_backend_id][sched->cur_copy];
         bool input_staging_event_waited = false;
@@ -2214,6 +2217,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             split_backend->iface.cpy_tensor_async;
                     const bool use_cache = cache_available && cache_source.backend == split_backend;
 
+                    if (!sched->callback_eval && split->graph.nodes[0]->ne[2] >= 64) {
+                        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(split_backend));
+                        auto fn = (ggml_backend_moe_prefill_stream_t) ggml_backend_reg_get_proc_address(
+                                reg, "ggml_backend_moe_prefill_stream");
+                        if (fn && fn(split_backend, split->graph.nodes[0], input,
+                                     use_cache ? &cache_source : nullptr, used_ids.data(), nullptr, nullptr)) {
+                            stream_experts = fn;
+                            stream_source = input;
+                            stream_cache = use_cache ? cache_source : ggml_backend_sched_moe_cache_source{};
+                            continue;
+                        }
+                    }
+
                     // Keep original groups and canonical tails; slot order is not expert-ID order.
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -2378,7 +2394,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             const int64_t t0 = ggml_backend_sched_timing_now(sched);
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec;
+            if (stream_experts) {
+                const bool accepted = stream_experts(split_backend, split->graph.nodes[0], stream_source,
+                        stream_cache.tensor ? &stream_cache : nullptr, used_ids.data(), &split->graph, &ec);
+                GGML_ASSERT(accepted);
+            } else {
+                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            }
             sched->timing.us_graph_compute_enqueue += ggml_backend_sched_timing_dt(sched, t0);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;

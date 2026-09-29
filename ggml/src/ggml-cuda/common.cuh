@@ -1580,6 +1580,28 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_moe_prefill_copy {
+    const void * source;
+    size_t offset;
+    size_t size;
+    bool device;
+};
+
+struct ggml_cuda_moe_prefill_group {
+    int first;
+    int count;
+    std::vector<ggml_cuda_moe_prefill_copy> copies;
+};
+
+struct ggml_cuda_moe_prefill {
+    const ggml_tensor * staged;
+    std::vector<ggml_cuda_moe_prefill_group> groups;
+    bool consumed = false;
+};
+
+struct ggml_backend_cuda_context;
+void ggml_cuda_moe_prefill_copy_group(ggml_backend_cuda_context & ctx, size_t group);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1595,6 +1617,7 @@ struct ggml_backend_cuda_context {
     cudaStream_t pp_copy_stream  = nullptr;
     cudaEvent_t  pp_copy_event_a = nullptr; // src main -> pp_copy_stream
     cudaEvent_t  pp_copy_event_b = nullptr; // pp_copy_stream -> dst main
+    ggml_cuda_moe_prefill * moe_prefill = nullptr; // stack-owned by one graph dispatch
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
 

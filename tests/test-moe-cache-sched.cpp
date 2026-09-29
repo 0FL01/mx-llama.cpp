@@ -84,7 +84,7 @@ static bool check_staged_bytes(ggml_tensor * tensor, bool ask, void * user_data)
 static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_tensor * weights,
                                   ggml_tensor * cache, const std::vector<uint8_t> & raw,
                                   const std::vector<int32_t> & ids, int tokens, int channels, int mode,
-                                  ggml_backend_t peer = nullptr) {
+                                  ggml_backend_t peer = nullptr, bool streamed = false) {
     context_ptr inputs(ggml_init({1024*1024, nullptr, true}), ggml_free);
     context_ptr compute(ggml_init({1024*1024, nullptr, true}), ggml_free);
     require(inputs && compute, "metadata allocation failed");
@@ -119,7 +119,7 @@ static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_
     require(bool(sched), "scheduler allocation failed");
     if (!peer) { ggml_backend_sched_set_tensor_backend(sched.get(), out, gpu); }
     ggml_backend_sched_set_sync_non_graph_inputs(sched.get(), false);
-    copy_state state = { &raw, cache, mode == 3 ? cpu : peer ? peer : gpu, std::vector<int32_t>(8, 3),
+    copy_state state = { &raw, cache, mode == 3 ? cpu : peer ? peer : gpu, std::vector<int32_t>(weights->ne[2], 3),
                          std::set<int32_t>(ids.begin(), ids.end()), weights->nb[2] };
     if (mode != 1) { // cold hook: all entries point to the zero dummy
         state.table[5] = 0;
@@ -129,7 +129,7 @@ static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_
     if (mode != 0) {
         ggml_backend_sched_set_moe_cache_lookup(sched.get(), lookup_cache, &state);
     }
-    ggml_backend_sched_set_eval_callback(sched.get(), check_staged_bytes, &state);
+    if (!streamed) { ggml_backend_sched_set_eval_callback(sched.get(), check_staged_bytes, &state); }
     require(ggml_backend_sched_alloc_graph(sched.get(), graph), "graph allocation failed");
     const char * owner_env = std::getenv("GGML_SCHED_MOE_PREFILL_OWNER");
     const bool prefer_owner = owner_env && std::atoi(owner_env) == 1 && tokens >= 64;
@@ -145,9 +145,13 @@ static std::vector<float> run_case(ggml_backend_t cpu, ggml_backend_t gpu, ggml_
     require(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS, "compute failed");
     ggml_backend_sched_synchronize(sched.get());
     active_copy = nullptr;
+    if (streamed) { check_staged_bytes(matmul, false, &state); }
     require(state.verified, "staging check did not run");
     size_t expected_copies = 0;
-    if (mode == 2 && (!peer || prefer_owner)) {
+    const char * stream_env = std::getenv("GGML_CUDA_MOE_PREFILL_STREAM");
+    const bool native_stream = streamed && stream_env && std::atoi(stream_env) == 1 &&
+                               tokens >= 64 && weights->type == GGML_TYPE_Q4_0;
+    if (!native_stream && mode == 2 && (!peer || prefer_owner)) {
         for (const auto id : state.used) { expected_copies += state.table[id] < 3; }
     }
     require(state.copies == expected_copies && state.bytes == expected_copies * state.expert_size,
@@ -260,6 +264,44 @@ int main() {
                 require(after == cached, "peer cache payload or dummy changed");
                 std::printf("PASS: two-device owner placement and canonical bytes\n");
             }
+        }
+        {
+            context_ptr host(ggml_init({1024*1024, nullptr, true}), ggml_free);
+            context_ptr device(ggml_init({1024*1024, nullptr, true}), ggml_free);
+            require(host && device, "stream metadata allocation failed");
+            auto * weights = ggml_new_tensor_3d(host.get(), GGML_TYPE_Q4_0, 256, 32, 48);
+            auto * cache = ggml_new_tensor_3d(device.get(), GGML_TYPE_Q4_0, 256, 32, 4);
+            buffer_ptr host_buffer(ggml_backend_alloc_ctx_tensors_from_buft(
+                    host.get(), ggml_backend_dev_host_buffer_type(gpu_device)), ggml_backend_buffer_free);
+            buffer_ptr device_buffer(ggml_backend_alloc_ctx_tensors(device.get(), gpu.get()), ggml_backend_buffer_free);
+            require(host_buffer && device_buffer, "stream buffer allocation failed");
+            ggml_backend_buffer_set_usage(host_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_set_usage(device_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<float> values(ggml_nelements(weights));
+            for (size_t i = 0; i < values.size(); ++i) { values[i] = std::sin(float(i)*0.031f) + float(i%7)*0.03f; }
+            std::vector<uint8_t> raw(ggml_nbytes(weights));
+            require(ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), raw.data(), 0, 32*48, 256, nullptr) == raw.size(),
+                    "stream quantization failed");
+            ggml_backend_tensor_set(weights, raw.data(), 0, raw.size());
+            std::vector<uint8_t> cached(ggml_nbytes(cache), 0);
+            const int residents[] = {5, 1, 7};
+            for (int slot = 0; slot < 3; ++slot) {
+                std::memcpy(cached.data() + slot*cache->nb[2], raw.data() + residents[slot]*weights->nb[2], weights->nb[2]);
+            }
+            ggml_backend_tensor_set(cache, cached.data(), 0, cached.size());
+            const int pattern[] = {1, 5, 15, 16, 31, 32, 47, 1};
+            std::vector<int32_t> ids(128);
+            for (size_t i = 0; i < ids.size(); ++i) { ids[i] = pattern[i%8]; }
+            const auto baseline = run_case(cpu.get(), gpu.get(), weights, cache, raw, ids, 64, 1, 0);
+            for (int mode : {1, 2, 3}) {
+                const auto actual = run_case(cpu.get(), gpu.get(), weights, cache, raw, ids, 64, 1, mode, nullptr, true);
+                require(std::memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)) == 0,
+                        "streamed group output changed");
+            }
+            std::vector<uint8_t> after(cached.size());
+            ggml_backend_tensor_get(cache, after.data(), 0, after.size());
+            require(after == cached, "stream changed cache payload or dummy");
+            std::printf("PASS: streamed group boundaries, canonical tails and exact outputs\n");
         }
         gpu->iface.cpy_tensor_async = original_copy;
         if (peer) { peer->iface.cpy_tensor_async = original_copy; }

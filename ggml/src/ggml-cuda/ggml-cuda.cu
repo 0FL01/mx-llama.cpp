@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-sched-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -3343,6 +3344,16 @@ static void ggml_backend_cuda_pp_copy_stream_init(ggml_backend_cuda_context * ct
     CUDA_CHECK(cudaEventCreateWithFlags(&ctx->pp_copy_event_b, cudaEventDisableTiming));
 }
 
+void ggml_cuda_moe_prefill_copy_group(ggml_backend_cuda_context & ctx, size_t group) {
+    GGML_ASSERT(ctx.moe_prefill && group < ctx.moe_prefill->groups.size());
+    for (const auto & copy : ctx.moe_prefill->groups[group].copies) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) ctx.moe_prefill->staged->data + copy.offset,
+                                   copy.source, copy.size,
+                                   copy.device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+                                   ctx.pp_copy_stream));
+    }
+}
+
 // Dedicated-stream cross-stage copy used by the meta backend's stage_transfer as a
 // fallback when ggml_backend_comm_sendrecv_tensor is not available (NCCL not built or
 // GGML_META_XFER_RCCL=0). Memcpy runs on a side stream so it doesn't serialize behind
@@ -5391,7 +5402,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled() && !g_cuda_outer_capture) {
+    if (graph->is_enabled() && !g_cuda_outer_capture && !cuda_ctx->moe_prefill) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -6739,8 +6750,96 @@ static void ggml_backend_cuda_token_graph_free(ggml_backend_t backend, void * ex
     }
 }
 
+static bool ggml_backend_cuda_moe_prefill_stream(
+        ggml_backend_t backend, ggml_tensor * op, const ggml_tensor * source,
+        const ggml_backend_sched_moe_cache_source * cache, const uint32_t * selected,
+        ggml_cgraph * graph, ggml_status * status) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_PREFILL_STREAM");
+        return value && atoi(value) == 1;
+    }();
+    if (!enabled) { return false; }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    const auto * staged = op->src[0];
+    if (ctx->copy_only || g_cuda_outer_capture || ctx->moe_prefill ||
+        ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_VEGA20 ||
+        op->op != GGML_OP_MUL_MAT_ID || op->ne[2] < 64 || source->type != GGML_TYPE_Q4_0 ||
+        source->ne[3] != 1 || op->src[1]->ne[3] != 1 || !ggml_is_contiguous(source) ||
+        !ggml_is_contiguous(staged) || !ggml_backend_buffer_is_host(source->buffer) ||
+        staged->buffer->buft != ggml_backend_cuda_buffer_type(ctx->device) ||
+        !ggml_cuda_should_use_mmq(source->type, GGML_CUDA_CC_VEGA20, op->ne[2], source->ne[2])) {
+        return false;
+    }
+    if (!graph) { return true; }
+    GGML_ASSERT(graph->n_nodes > 0 && graph->nodes[0] == op && status);
+    ggml_cuda_moe_prefill plan = { staged, {}, false };
+    const int n_experts = source->ne[2];
+    const size_t expert_size = source->nb[2];
+    const size_t tail_size = std::min<size_t>(expert_size, 512);
+    std::vector<bool> head_ready(n_experts, false);
+    uint64_t host_bytes = 0, device_bytes = 0;
+    for (int first = 0; first < n_experts; first += 16) {
+        ggml_cuda_moe_prefill_group group = { first, std::min(16, n_experts - first), {} };
+        const auto append = [&](const void * data, size_t offset, size_t size, bool device) {
+            if (!size) { return; }
+            device_bytes += device ? size : 0;
+            host_bytes += device ? 0 : size;
+            if (!group.copies.empty()) {
+                auto & last = group.copies.back();
+                if (last.device == device && last.offset + last.size == offset &&
+                    (const char *) last.source + last.size == data) {
+                    last.size += size;
+                    return;
+                }
+            }
+            group.copies.push_back({ data, offset, size, device });
+        };
+        for (int expert = first; expert < first + group.count; ++expert) {
+            if (!(selected[expert >> 5] & (uint32_t(1) << (expert & 31)))) { continue; }
+            const size_t skip = head_ready[expert] ? tail_size : 0;
+            const size_t offset = expert * expert_size;
+            const int slot = cache ? cache->table[expert] : -1;
+            const bool hit = cache && slot >= 0 && slot < cache->n_slots;
+            const auto * data = hit ? (const char *) cache->tensor->data + slot * expert_size :
+                                     (const char *) source->data + offset;
+            append(data + skip, offset + skip, expert_size - skip, hit);
+            const bool end_run = expert == first + group.count - 1 ||
+                    !(selected[(expert + 1) >> 5] & (uint32_t(1) << ((expert + 1) & 31)));
+            if (end_run && expert + 1 < n_experts) {
+                append((const char *) source->data + offset + expert_size,
+                       offset + expert_size, tail_size, false);
+                head_ready[expert + 1] = true;
+            }
+        }
+        if (!group.copies.empty()) { plan.groups.push_back(std::move(group)); }
+    }
+    GGML_ASSERT(!plan.groups.empty());
+    ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_pp_copy_stream_init(ctx);
+    // Protect reuse of the existing full-layout temporary from prior readers.
+    CUDA_CHECK(cudaEventRecord(ctx->pp_copy_event_a, ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->pp_copy_stream, ctx->pp_copy_event_a, 0));
+    ctx->moe_prefill = &plan;
+    *status = ggml_backend_cuda_graph_compute(backend, graph);
+    GGML_ASSERT(plan.consumed);
+    ctx->moe_prefill = nullptr;
+    static const bool trace = [] {
+        const char * value = getenv("GGML_CUDA_MOE_PREFILL_TRACE");
+        return value && atoi(value) == 1;
+    }();
+    if (trace) {
+        GGML_LOG_INFO("moe-prefill-stream: tensor=%s groups=%zu h2d_bytes=%llu d2d_bytes=%llu\n",
+                      source->name, plan.groups.size(), (unsigned long long) host_bytes,
+                      (unsigned long long) device_bytes);
+    }
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_moe_prefill_stream") == 0) {
+        return (void *) ggml_backend_cuda_moe_prefill_stream;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

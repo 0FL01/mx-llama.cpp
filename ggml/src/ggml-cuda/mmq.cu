@@ -360,7 +360,30 @@ void ggml_cuda_mul_mat_q(
             ne02, ne02, s02, workspace_s12, s2,
             ne03, ne13, s03, workspace_s13, s3,
             iter_ne12};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        if (ctx.moe_prefill && !ctx.moe_prefill->consumed && ctx.moe_prefill->staged == src0) {
+            auto & plan = *ctx.moe_prefill;
+            ggml_cuda_moe_prefill_copy_group(ctx, 0);
+            CUDA_CHECK(cudaStreamSynchronize(ctx.pp_copy_stream));
+            for (size_t group = 0; group < plan.groups.size(); ++group) {
+                if (group + 1 < plan.groups.size()) {
+                    ggml_cuda_moe_prefill_copy_group(ctx, group + 1);
+                }
+                const auto & range = plan.groups[group];
+                mmq_args part = args;
+                part.x += range.first * src0->nb[2];
+                part.expert_bounds += range.first;
+                part.nchannels_x = part.nchannels_y = range.count;
+                ggml_cuda_mul_mat_q_switch_type(ctx, part, stream);
+                // Host drain also observes SDMA completion with HWQ=8. It does not
+                // drain main: current MMQ can run while the next group arrives.
+                if (group + 1 < plan.groups.size()) {
+                    CUDA_CHECK(cudaStreamSynchronize(ctx.pp_copy_stream));
+                }
+            }
+            plan.consumed = true;
+        } else {
+            ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        }
     }
 }
 
