@@ -6,6 +6,7 @@
 #include "speculative.h"
 
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
@@ -106,6 +107,38 @@ static void test(void) {
         common_params_speculative spec;
         spec.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
 
+        for (int32_t n_max : { 0, -1, 9, 65538 }) {
+            spec.ngram_cache.n_max = n_max;
+            try {
+                common_speculative_n_max(&spec);
+                assert(false);
+            } catch (const std::invalid_argument &) {
+            }
+            try {
+                common_speculative_ptr drafter(common_speculative_init(spec, 1));
+                assert(false);
+            } catch (const std::invalid_argument &) {
+            }
+        }
+    }
+
+    {
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        spec.draft.n_max = 2;
+        for (int32_t n_max : { 8, 2, 1 }) {
+            spec.ngram_cache.n_max = n_max;
+            assert(common_speculative_n_max(&spec) == (n_max == 8 ? 8 : 2));
+            assert(spec.draft.n_max == 2);
+            assert(spec.need_n_rs_seq() == 2);
+        }
+    }
+
+    for (int32_t n_max : { 8, 2 }) {
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
+        spec.ngram_cache.n_max = n_max;
+
         common_speculative_ptr drafter(common_speculative_init(spec, 1));
         assert(drafter != nullptr);
 
@@ -158,6 +191,104 @@ static void test(void) {
             common_ngram_cache_draft(input, draft, 8, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, context, dynamic, stat);
             assert(draft == llama_tokens({ 40, 10, 20, 30, 40, 10, 20, 30, 40 }));
         }
+
+        auto draft = [](common_speculative * drafter, const llama_tokens & prompt, llama_token id_last, int32_t budget) {
+            common_speculative_begin(drafter, 0, prompt);
+            llama_tokens result;
+            auto & dp = common_speculative_get_draft_params(drafter, 0);
+            dp.drafting = true;
+            dp.n_max = budget;
+            dp.n_past = static_cast<llama_pos>(prompt.size());
+            dp.prompt = &prompt;
+            dp.id_last = id_last;
+            dp.result = &result;
+            common_speculative_draft(drafter);
+            assert(!dp.drafting);
+            return result;
+        };
+
+        const llama_tokens expected = { 10, 20, 30, 40, 10, 20, 30, 40 };
+        llama_tokens prompt = history;
+        prompt.pop_back();
+        for (int32_t n_max : { 8, 2 }) {
+            common_params_speculative spec;
+            spec.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
+            assert(spec.ngram_cache.n_max == 8);
+            if (n_max == 2) {
+                spec.ngram_cache.n_max = 2;
+            }
+            assert(common_speculative_n_max(&spec) == n_max);
+            assert(spec.need_n_rs_seq() == 0);
+            common_speculative_ptr drafter(common_speculative_init(spec, 1));
+            assert(drafter != nullptr);
+            assert(common_speculative_n_max(drafter.get()) == n_max);
+            assert_output_limits(16, 1, common_speculative_n_max(&spec), n_max + 1, n_max + 1);
+
+            llama_tokens capped = expected;
+            capped.resize(n_max);
+            assert(draft(drafter.get(), prompt, pattern.back(), -1) == capped);
+            assert(draft(drafter.get(), prompt, pattern.back(), 1) == llama_tokens({ 10 }));
+            if (capped.size() > 5) {
+                capped.resize(5);
+            }
+            assert(draft(drafter.get(), prompt, pattern.back(), 5) == capped);
+        }
+
+        struct cache_files {
+            std::filesystem::path dir;
+            std::string dynamic;
+            std::string stat;
+
+            cache_files() {
+                for (size_t i = 0; ; ++i) {
+                    dir = "test-arg-parser-ngram-cache-" + std::to_string(i);
+                    if (std::filesystem::create_directory(dir)) {
+                        dynamic = (dir / "dynamic.bin").string();
+                        stat = (dir / "static.bin").string();
+                        break;
+                    }
+                }
+            }
+
+            ~cache_files() {
+                std::error_code ec;
+                std::filesystem::remove(dynamic, ec);
+                std::filesystem::remove(stat, ec);
+                std::filesystem::remove(dir, ec);
+            }
+        } files;
+
+        common_ngram_cache dynamic;
+        common_ngram_cache stat;
+        common_ngram_cache_update(dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, history, history.size(), false);
+        common_ngram_cache_update(stat, LLAMA_NGRAM_STATIC, LLAMA_NGRAM_STATIC, history, history.size(), false);
+        common_ngram_cache_save(dynamic, files.dynamic);
+        common_ngram_cache_save(stat, files.stat);
+        assert(common_ngram_cache_load(files.dynamic) == dynamic);
+        assert(common_ngram_cache_load(files.stat) == stat);
+
+        const llama_tokens short_prompt = { 10, 20, 30 };
+        for (int32_t n_max : { 8, 2 }) {
+            for (int mode = 0; mode < 3; ++mode) {
+                common_params_speculative spec;
+                spec.types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
+                spec.ngram_cache.n_max = n_max;
+                if (mode == 0 || mode == 2) {
+                    spec.ngram_cache.lookup_cache_dynamic = files.dynamic;
+                }
+                if (mode == 1 || mode == 2) {
+                    spec.ngram_cache.lookup_cache_static = files.stat;
+                }
+                common_speculative_ptr drafter(common_speculative_init(spec, 1));
+                assert(drafter != nullptr);
+                llama_tokens capped = expected;
+                capped.resize(n_max);
+                assert(draft(drafter.get(), short_prompt, pattern.back(), -1) == capped);
+                assert(draft(drafter.get(), short_prompt, pattern.back(), -1) == capped);
+            }
+        }
+        assert(common_ngram_cache_load(files.dynamic) == dynamic);
+        assert(common_ngram_cache_load(files.stat) == stat);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -312,6 +443,36 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+
+    for (llama_example ex : { LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI }) {
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-draft-n-max", "2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, ex));
+        assert(cache_params.speculative.ngram_cache.n_max == 8);
+        assert(cache_params.speculative.draft.n_max == 2);
+        assert(common_speculative_n_max(&cache_params.speculative) == 8);
+
+        for (int n_max = 1; n_max <= 8; ++n_max) {
+            common_params value_params;
+            argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-draft-n-max", "2",
+                    "--spec-ngram-cache-n-max", std::to_string(n_max)};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), value_params, ex));
+            assert(value_params.speculative.ngram_cache.n_max == n_max);
+            assert(value_params.speculative.draft.n_max == 2);
+            assert(common_speculative_n_max(&value_params.speculative) == n_max);
+        }
+
+        for (const char * value : { "0", "-1", "9", "65538", "garbage", "2x", "999999999999999999999999" }) {
+            common_params value_params;
+            argv = {"binary_name", "-m", "model_file.gguf", "--spec-ngram-cache-n-max", value};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), value_params, ex));
+            assert(value_params.speculative.ngram_cache.n_max == 8);
+        }
+
+        common_params missing_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-ngram-cache-n-max"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), missing_params, ex));
+    }
 
     {
         common_params synth_params;
