@@ -664,6 +664,24 @@ void llama_context::sched_reserve() {
             sync_non_graph_inputs = atoi(value) != 0;
         }
         ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
+        const char * prefill_d2d = getenv("LLAMA_MOE_CACHE_PREFILL_D2D");
+        if (moe_cache && prefill_d2d && strcmp(prefill_d2d, "0") != 0) {
+            ggml_backend_sched_set_moe_cache_lookup(result,
+                    [](const ggml_tensor * weight, ggml_backend_sched_moe_cache_source * source, void * user_data) {
+                        const auto * cache = static_cast<const llama_moe_cache *>(user_data);
+                        for (const auto & layer : cache->layers) {
+                            const ggml_tensor * tensor = weight == layer.up_src ? layer.up_c :
+                                    weight == layer.gate_src ? layer.gate_c :
+                                    weight == layer.down_src ? layer.down_c : nullptr;
+                            if (tensor) {
+                                *source = { layer.backend, tensor,
+                                        static_cast<const int32_t *>(layer.host_table->data), layer.n_slots };
+                                return true;
+                            }
+                        }
+                        return false;
+                    }, moe_cache.get());
+        }
         return result;
     };
 

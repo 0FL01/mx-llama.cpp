@@ -830,6 +830,11 @@ struct ggml_backend_sched_timing {
     int64_t us_non_graph_input_fallback_copy;
     int64_t us_moe_ids;
     int64_t us_moe_expert_set;
+    int64_t moe_cache_hits;
+    int64_t moe_cache_misses;
+    int64_t moe_h2d_bytes;
+    int64_t moe_d2d_bytes;
+    int64_t moe_tail_bytes;
     int64_t us_graph_compute_enqueue;
     int64_t us_split_event_record;
 };
@@ -882,6 +887,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    ggml_backend_sched_moe_cache_lookup moe_cache_lookup;
+    void * moe_cache_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -991,6 +999,12 @@ static void ggml_backend_sched_timing_maybe_print(ggml_backend_sched_t sched) {
         t->us_non_graph_input_async_try, t->us_non_graph_input_fallback_wait,
         t->us_non_graph_input_fallback_copy, t->us_moe_ids, t->us_moe_expert_set,
         t->us_graph_compute_enqueue, t->us_split_event_record);
+
+    fprintf(stderr,
+        "%s: moe_cache_hits=%" PRId64 " misses=%" PRId64 " h2d_bytes=%" PRId64
+        " d2d_bytes=%" PRId64 " tail_bytes=%" PRId64 "\n",
+        __func__, t->moe_cache_hits, t->moe_cache_misses, t->moe_h2d_bytes,
+        t->moe_d2d_bytes, t->moe_tail_bytes);
 
     ggml_backend_sched_timing_reset(t);
 }
@@ -2139,7 +2153,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
+                    ggml_backend_sched_moe_cache_source cache_source = {};
+                    const char * reg_name = sched->moe_cache_lookup ? ggml_backend_reg_name(
+                            ggml_backend_dev_backend_reg(ggml_backend_get_device(split_backend))) : nullptr;
+                    // CUDA/HIP consume range descriptors at enqueue; only device pointers survive.
+                    const bool range_copy_supported = reg_name &&
+                            (strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "CUDA") == 0);
+                    const bool use_cache = sched->moe_cache_lookup && range_copy_supported &&
+                            sched->moe_cache_lookup(input, &cache_source, sched->moe_cache_user_data) &&
+                            cache_source.backend == split_backend && cache_source.tensor && cache_source.table &&
+                            cache_source.n_slots > 0 && cache_source.tensor->type == input->type &&
+                            cache_source.tensor->ne[0] == input->ne[0] &&
+                            cache_source.tensor->ne[1] == input->ne[1] &&
+                            cache_source.tensor->ne[2] > cache_source.n_slots && cache_source.tensor->ne[3] == 1 &&
+                            cache_source.tensor->nb[2] == expert_size && cache_source.tensor->buffer &&
+                            cache_source.tensor->data && ggml_is_contiguous(cache_source.tensor) &&
+                            split_backend->iface.cpy_tensor_async;
+
+                    // Keep original groups and canonical tails; slot order is not expert-ID order.
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
@@ -2147,12 +2178,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
                         const int64_t t_copy_experts = ggml_backend_sched_timing_now(sched);
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                        const auto copy_host = [&](size_t offset, size_t size) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                    (const uint8_t *) input->data + offset, offset, size);
+                            sched->timing.moe_h2d_bytes += sched->timing.enabled ? size : 0;
+                        };
+                        if (!use_cache) {
+                            copy_host(expert_offset, expert_size_copy + padding_end);
+                        } else {
+                            int32_t host_first = first_id;
+                            const auto flush_host = [&](int32_t end) {
+                                const size_t tail = end == last_id + 1 ? padding_end : 0;
+                                if (host_first < end || tail) {
+                                    // Keep each miss run and its canonical tail in one H2D transfer.
+                                    copy_host(host_first * expert_size, (end - host_first) * expert_size + tail);
+                                }
+                            };
+                            for (int32_t expert = first_id; expert <= last_id; ++expert) {
+                                const int32_t slot = cache_source.table[expert];
+                                bool copied = false;
+                                if (slot >= 0 && slot < cache_source.n_slots) {
+                                    ggml_tensor src = {}, dst = {};
+                                    src.type = dst.type = input->type;
+                                    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                                        src.ne[dim] = dst.ne[dim] = dim < 2 ? input->ne[dim] : 1;
+                                        src.nb[dim] = dst.nb[dim] = dim < 3 ? input->nb[dim] : expert_size;
+                                    }
+                                    src.buffer = cache_source.tensor->buffer;
+                                    dst.buffer = input_cpy->buffer;
+                                    src.data = (uint8_t *) cache_source.tensor->data + slot * expert_size;
+                                    dst.data = (uint8_t *) input_cpy->data + expert * expert_size;
+                                    copied = split_backend->iface.cpy_tensor_async(
+                                            split_backend, split_backend, &src, &dst);
+                                }
+                                if (copied) {
+                                    flush_host(expert);
+                                    host_first = expert + 1;
+                                    sched->timing.moe_cache_hits += sched->timing.enabled ? 1 : 0;
+                                    sched->timing.moe_d2d_bytes += sched->timing.enabled ? expert_size : 0;
+                                } else {
+                                    sched->timing.moe_cache_misses += sched->timing.enabled ? 1 : 0;
+                                }
+                            }
+                            flush_host(last_id + 1);
+                        }
+                        sched->timing.moe_tail_bytes += sched->timing.enabled ? padding_end : 0;
                         sched->timing.us_moe_expert_set += ggml_backend_sched_timing_dt(sched, t_copy_experts);
                     };
 
@@ -2529,6 +2599,13 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 void ggml_backend_sched_set_sync_non_graph_inputs(ggml_backend_sched_t sched, bool enabled) {
     GGML_ASSERT(sched);
     sched->sync_non_graph_inputs = enabled;
+}
+
+void ggml_backend_sched_set_moe_cache_lookup(
+        ggml_backend_sched_t sched, ggml_backend_sched_moe_cache_lookup lookup, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->moe_cache_lookup = lookup;
+    sched->moe_cache_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

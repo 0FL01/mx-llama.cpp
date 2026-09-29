@@ -303,6 +303,7 @@ llama_build_and_test(test-q4-repack-layout.cpp)
 if (GGML_HIP)
   # Manual real-model oracle; requires explicit model/prompt arguments.
   llama_build(test-q4-repack-model.cpp)
+  llama_build(test-moe-cache-prefill.cpp)
   llama_build_and_test(test-q4-repack-gpu.cpp LABEL "gpu")
   set_tests_properties(test-q4-repack-gpu PROPERTIES
     SKIP_RETURN_CODE 77
@@ -311,6 +312,10 @@ if (GGML_HIP)
   set_tests_properties(test-q4-repack-tp PROPERTIES
     SKIP_RETURN_CODE 77
     ENVIRONMENT "GGML_CUDA_REPACK_Q4_0=1")
+  llama_build_and_test(test-moe-cache-sched.cpp LABEL "gpu")
+  set_tests_properties(test-moe-cache-sched PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "GGML_CUDA_REPACK_Q4_0=0")
 endif()
 llama_build_and_test(test-moe-cache.cpp)
 llama_build_and_test(test-dummy-mmvq.cpp)
