@@ -65,6 +65,7 @@
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventQuery hipEventQuery
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaErrorNotReady hipErrorNotReady
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy

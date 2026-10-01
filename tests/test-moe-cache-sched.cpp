@@ -303,6 +303,38 @@ int main() {
             require(after == cached, "stream changed cache payload or dummy");
             std::printf("PASS: streamed group boundaries, canonical tails and exact outputs\n");
         }
+        const char * device_trace_env = std::getenv("GGML_CUDA_MOE_PREFILL_DEVICE_TRACE");
+        const char * native_stream_env = std::getenv("GGML_CUDA_MOE_PREFILL_STREAM");
+        if (device_trace_env && std::atoi(device_trace_env) == 1 &&
+            native_stream_env && std::atoi(native_stream_env) == 1) {
+            context_ptr host(ggml_init({1024*1024, nullptr, true}), ggml_free);
+            context_ptr device(ggml_init({1024*1024, nullptr, true}), ggml_free);
+            require(host && device, "trace probe metadata allocation failed");
+            auto * weights = ggml_new_tensor_3d(host.get(), GGML_TYPE_Q4_0, 4096, 4096, 8);
+            ggml_set_name(weights, "device_trace_large_h2d");
+            auto * cache = ggml_new_tensor_3d(device.get(), GGML_TYPE_Q4_0, 32, 1, 4);
+            buffer_ptr host_buffer(ggml_backend_alloc_ctx_tensors_from_buft(
+                    host.get(), ggml_backend_dev_host_buffer_type(gpu_device)), ggml_backend_buffer_free);
+            buffer_ptr device_buffer(ggml_backend_alloc_ctx_tensors(device.get(), gpu.get()), ggml_backend_buffer_free);
+            require(host_buffer && device_buffer, "trace probe buffer allocation failed");
+            ggml_backend_buffer_set_usage(host_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_set_usage(device_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<float> values(weights->ne[0], 0.25f);
+            std::vector<uint8_t> row(weights->nb[1]);
+            require(ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), row.data(), 0, 1, weights->ne[0], nullptr) == row.size(),
+                    "trace probe quantization failed");
+            std::vector<uint8_t> raw(ggml_nbytes(weights));
+            for (size_t offset = 0; offset < raw.size(); offset += row.size()) {
+                std::memcpy(raw.data() + offset, row.data(), row.size());
+            }
+            ggml_backend_tensor_set(weights, raw.data(), 0, raw.size());
+            ggml_backend_buffer_clear(device_buffer.get(), 0);
+            std::vector<int32_t> ids(128);
+            for (size_t i = 0; i < ids.size(); ++i) { ids[i] = i%2 ? 5 : 1; }
+            // No cache hook: two 9 MiB experts exercise the native trace H2D timing floor.
+            run_case(cpu.get(), gpu.get(), weights, cache, raw, ids, 64, 1, 0, nullptr, true);
+            std::printf("PASS: device trace large H2D probe bytes=%zu\n", 2 * weights->nb[2] + 1024);
+        }
         gpu->iface.cpy_tensor_async = original_copy;
         if (peer) { peer->iface.cpy_tensor_async = original_copy; }
         std::printf("PASS: %d canonical-byte/output/cache/async-D2D cases\n", cases);

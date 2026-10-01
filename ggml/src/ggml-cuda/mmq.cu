@@ -3,6 +3,7 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cmath>
 #include <cstdint>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -317,6 +318,42 @@ void ggml_cuda_mul_mat_q(
         ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
         ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
 
+    const bool native_prefill = ctx.moe_prefill && !ctx.moe_prefill->consumed && ctx.moe_prefill->staged == src0;
+    static const bool device_trace_enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_PREFILL_DEVICE_TRACE");
+        return value && atoi(value) == 1;
+    }();
+    int64_t trace_chunks = 0;
+    size_t trace_groups = 0;
+    std::vector<cudaEvent_t> trace_events;
+    if (native_prefill && device_trace_enabled) {
+        trace_chunks = (ne12 - 1) / chunk_ne12 + 1;
+        trace_groups = ctx.moe_prefill->groups.size();
+        // Bound diagnostics to 4097 events per operation; do not emit a partial timeline.
+        constexpr size_t max_events = 4097;
+        if (trace_groups > (max_events - 1) / 4 ||
+            uint64_t(trace_chunks - 1) > (max_events - 1 - 4 * trace_groups) / 2) {
+            GGML_LOG_WARN("moe-prefill-device-trace: device=%d status=skipped_event_limit groups=%zu chunks=%lld\n",
+                          ctx.device, trace_groups, (long long) trace_chunks);
+        } else {
+            trace_events.resize(1 + 4 * trace_groups + 2 * (trace_chunks - 1));
+            for (auto & event : trace_events) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, 0));
+            }
+            CUDA_CHECK(cudaEventRecord(trace_events[0], stream));
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.pp_copy_stream, trace_events[0], 0));
+        }
+    }
+    const auto copy_group = [&](size_t group) {
+        if (!trace_events.empty()) {
+            CUDA_CHECK(cudaEventRecord(trace_events[1 + 4 * group], ctx.pp_copy_stream));
+        }
+        ggml_cuda_moe_prefill_copy_group(ctx, group);
+        if (!trace_events.empty()) {
+            CUDA_CHECK(cudaEventRecord(trace_events[2 + 4 * group], ctx.pp_copy_stream));
+        }
+    };
+
     for (int64_t token = 0; token < ne12; token += chunk_ne12) {
         const int64_t iter_ne12 = std::min(chunk_ne12, ne12 - token);
         const int64_t iter_rows = iter_ne12*n_expert_used;
@@ -362,18 +399,24 @@ void ggml_cuda_mul_mat_q(
             iter_ne12};
         if (ctx.moe_prefill && !ctx.moe_prefill->consumed && ctx.moe_prefill->staged == src0) {
             auto & plan = *ctx.moe_prefill;
-            ggml_cuda_moe_prefill_copy_group(ctx, 0);
+            copy_group(0);
             CUDA_CHECK(cudaStreamSynchronize(ctx.pp_copy_stream));
             for (size_t group = 0; group < plan.groups.size(); ++group) {
                 if (group + 1 < plan.groups.size()) {
-                    ggml_cuda_moe_prefill_copy_group(ctx, group + 1);
+                    copy_group(group + 1);
                 }
                 const auto & range = plan.groups[group];
                 mmq_args part = args;
                 part.x += range.first * src0->nb[2];
                 part.expert_bounds += range.first;
                 part.nchannels_x = part.nchannels_y = range.count;
+                if (!trace_events.empty()) {
+                    CUDA_CHECK(cudaEventRecord(trace_events[3 + 4 * group], stream));
+                }
                 ggml_cuda_mul_mat_q_switch_type(ctx, part, stream);
+                if (!trace_events.empty()) {
+                    CUDA_CHECK(cudaEventRecord(trace_events[4 + 4 * group], stream));
+                }
                 // Host drain also observes SDMA completion with HWQ=8. It does not
                 // drain main: current MMQ can run while the next group arrives.
                 if (group + 1 < plan.groups.size()) {
@@ -382,7 +425,68 @@ void ggml_cuda_mul_mat_q(
             }
             plan.consumed = true;
         } else {
+            const size_t event = trace_events.empty() ? 0 : 1 + 4 * trace_groups + 2 * (token / chunk_ne12 - 1);
+            if (!trace_events.empty()) {
+                CUDA_CHECK(cudaEventRecord(trace_events[event], stream));
+            }
             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+            if (!trace_events.empty()) {
+                CUDA_CHECK(cudaEventRecord(trace_events[event + 1], stream));
+            }
+        }
+    }
+
+    if (!trace_events.empty()) {
+        // Keep the existing SIDE host drains. This end drain is diagnostics only.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaEventQuery(trace_events[0]));
+        const auto interval = [&](size_t event, float & begin, float & end) {
+            CUDA_CHECK(cudaEventQuery(trace_events[event]));
+            CUDA_CHECK(cudaEventQuery(trace_events[event + 1]));
+            CUDA_CHECK(cudaEventElapsedTime(&begin, trace_events[0], trace_events[event]));
+            CUDA_CHECK(cudaEventElapsedTime(&end, trace_events[0], trace_events[event + 1]));
+            GGML_ASSERT(std::isfinite(begin) && std::isfinite(end) && begin >= 0 && end >= begin);
+        };
+        // Hex names keep the key/value records parseable for arbitrary tensor names.
+        const auto hex_name = [](const char * name) {
+            std::string result;
+            for (const unsigned char * p = (const unsigned char *) name; *p; ++p) {
+                result += "0123456789abcdef"[*p >> 4];
+                result += "0123456789abcdef"[*p & 15];
+            }
+            return result;
+        };
+        const std::string tensor = hex_name(ggml_get_name(src0));
+        const std::string op = hex_name(ggml_get_name(dst));
+        GGML_LOG_INFO("moe-prefill-device-trace: tensor_hex=%s op_hex=%s device=%d reference=main units=ms groups=%zu chunks=%lld events=%zu complete=1\n",
+                      tensor.c_str(), op.c_str(), ctx.device, trace_groups, (long long) trace_chunks, trace_events.size());
+        for (size_t group = 0; group < trace_groups; ++group) {
+            const auto & range = ctx.moe_prefill->groups[group];
+            uint64_t h2d_bytes = 0, d2d_bytes = 0;
+            for (const auto & copy : range.copies) {
+                (copy.device ? d2d_bytes : h2d_bytes) += copy.size;
+            }
+            float copy_begin, copy_end, compute_begin, compute_end;
+            interval(1 + 4 * group, copy_begin, copy_end);
+            interval(3 + 4 * group, compute_begin, compute_end);
+            GGML_ASSERT(compute_begin >= copy_end);
+            // Even a Gen4 x16 MI50 endpoint cannot exceed 32 GB/s; amude's root is Gen3.
+            GGML_ASSERT(h2d_bytes < 4 * 1024 * 1024 ||
+                        double(copy_end - copy_begin) >= double(h2d_bytes) / 32e6);
+            GGML_LOG_INFO("moe-prefill-device-trace: tensor_hex=%s op_hex=%s device=%d chunk=0 token_first=0 token_count=%lld group=%zu expert_first=%d expert_count=%d h2d_bytes=%llu d2d_bytes=%llu copy_begin_ms=%.6f copy_end_ms=%.6f compute_begin_ms=%.6f compute_end_ms=%.6f valid=1\n",
+                          tensor.c_str(), op.c_str(), ctx.device, (long long) chunk_ne12, group, range.first, range.count,
+                          (unsigned long long) h2d_bytes, (unsigned long long) d2d_bytes,
+                          copy_begin, copy_end, compute_begin, compute_end);
+        }
+        for (int64_t chunk = 1; chunk < trace_chunks; ++chunk) {
+            float begin, end;
+            interval(1 + 4 * trace_groups + 2 * (chunk - 1), begin, end);
+            GGML_LOG_INFO("moe-prefill-device-trace: tensor_hex=%s op_hex=%s device=%d chunk=%lld token_first=%lld token_count=%lld group=all expert_first=0 expert_count=%lld h2d_bytes=0 d2d_bytes=0 compute_begin_ms=%.6f compute_end_ms=%.6f valid=1\n",
+                          tensor.c_str(), op.c_str(), ctx.device, (long long) chunk, (long long) (chunk * chunk_ne12),
+                          (long long) std::min(chunk_ne12, ne12 - chunk * chunk_ne12), (long long) ne02, begin, end);
+        }
+        for (auto event : trace_events) {
+            CUDA_CHECK(cudaEventDestroy(event));
         }
     }
 }

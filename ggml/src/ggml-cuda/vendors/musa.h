@@ -52,6 +52,7 @@
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
 #define cudaEventDisableTiming musaEventDisableTiming
 #define cudaEventQuery musaEventQuery
+#define cudaEventElapsedTime musaEventElapsedTime
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaEvent_t musaEvent_t
